@@ -78,6 +78,10 @@ final class SessionToolsModel: ObservableObject {
     /// the other computer, and it must not replace this Mac's clipboard,
     /// unless sharing was turned on in Settings or for the session.
     static let shareClipboardKey = "MacViewer.shareClipboard"
+    static let privatePasteboardTypes: Set<NSPasteboard.PasteboardType> = [
+        NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"),
+        NSPasteboard.PasteboardType("org.nspasteboard.TransientType"),
+    ]
     private let defaults: UserDefaults
 
     init(pasteboard: NSPasteboard = .general, defaults: UserDefaults = .standard) {
@@ -255,6 +259,8 @@ final class SessionToolsModel: ObservableObject {
         let previousChange = clipboardChange
         let previousText = latestClipboardText
         clipboardChange = change
+        // Password managers mark copied secrets (nspasteboard.org); never send them.
+        guard Set(pasteboard.types ?? []).isDisjoint(with: Self.privatePasteboardTypes) else { return }
         guard let text = pasteboard.string(forType: .string), text != latestClipboardText else { return }
         guard text.utf16.count <= 524_288 else {
             errorMessage = "Clipboard text exceeds the 1 MB sharing limit."; return

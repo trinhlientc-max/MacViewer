@@ -5,7 +5,7 @@ import UltraViewerProtocol
 @MainActor
 final class MacHostingModel: ObservableObject {
     enum Phase { case off, registering, ready, awaitingApproval, sharing, failed }
-    @Published private(set) var phase = Phase.off
+    @Published private(set) var phase = Phase.off { didSet { updateKeepAwake() } }
     @Published private(set) var identifier: String?
     @Published private(set) var password = ""
     @Published private(set) var status = "Start sharing to get this Mac’s UltraViewer ID."
@@ -49,6 +49,10 @@ final class MacHostingModel: ObservableObject {
     static let displaySelectionKey = "MacViewer.hostDisplaySelection"
     static let masterPasswordAutoAcceptKey = "MacViewer.masterPasswordAutoAccept"
     static let autoAcceptAllKey = "MacViewer.autoAcceptAllConnections"
+    static let rotatePasswordKey = "MacViewer.rotatePasswordAfterSession"
+    /// A viewer left during an approved side switch; the password changes once
+    /// that switch has finished.
+    private var pendingPasswordRotation = false
 
     init(defaults: UserDefaults = .standard,
          displayProvider: @escaping @MainActor () -> [MacSharingDisplay] = MacSharingDisplay.current) {
@@ -256,12 +260,14 @@ final class MacHostingModel: ObservableObject {
                         input.releaseAll(); viewer = nil; pendingRequest = nil
                         allowsControl = false; isApproving = false; isAutoApproving = false; phase = .ready
                         status = reason ?? "The Windows computer disconnected."
+                        rotatePasswordAfterSession()
                     }
                 }
                 guard generation == token else { return }
                 stop()
             } catch {
                 guard generation == token else { return }
+                discardPasswordIfVisited(viewer != nil || pendingRequest != nil || pendingPasswordRotation)
                 tools.deactivate()
                 cancelSideSwitch()
                 cancelControlUpdate(); isEndingViewer = false
@@ -344,10 +350,12 @@ final class MacHostingModel: ObservableObject {
                 // A callback may itself stop/restart hosting. Never end a new
                 // peer that happened to replace this approved viewer.
                 if generation == token, viewer?.id == request.sessionID { endViewer() }
+                if generation == token, pendingPasswordRotation, viewer == nil { rotatePasswordAfterSession() }
             } catch {
                 guard generation == token, sideSwitchGeneration == operation else { return }
                 pendingSideSwitch = nil; isApprovingSideSwitch = false; sideSwitchTask = nil
                 if !Task.isCancelled { errorMessage = "Could not switch control sides. Ask Windows to try again." }
+                if pendingPasswordRotation, viewer == nil { rotatePasswordAfterSession() }
             }
         }
     }
@@ -425,6 +433,7 @@ final class MacHostingModel: ObservableObject {
     }
 
     func stop() {
+        discardPasswordIfVisited(viewer != nil || pendingRequest != nil || pendingPasswordRotation)
         tools.deactivate()
         cancelSideSwitch()
         cancelControlUpdate(); isEndingViewer = false
@@ -458,6 +467,45 @@ final class MacHostingModel: ObservableObject {
         do { _ = try MacRegistrationProfile.loadOrCreate(forHosting: true, regeneratePassword: true) }
         catch { errorMessage = "A new password could not be created: \(error.localizedDescription)"; return }
         if wasRunning { restartAfterStopping() }
+    }
+
+    /// Held while a viewer is connected, so neither idle display sleep nor idle
+    /// system sleep cuts off the screen they are watching. Waiting for a
+    /// connection does not keep the Mac awake.
+    private var keepAwake: NSObjectProtocol?
+
+    private func updateKeepAwake() {
+        if phase == .sharing, keepAwake == nil {
+            keepAwake = ProcessInfo.processInfo.beginActivity(
+                options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled],
+                reason: "A remote viewer is connected to this Mac")
+        } else if phase != .sharing, let activity = keepAwake {
+            ProcessInfo.processInfo.endActivity(activity)
+            keepAwake = nil
+        }
+    }
+
+    private var rotatesPasswordAfterSession: Bool {
+        defaults.object(forKey: Self.rotatePasswordKey) as? Bool ?? true
+    }
+
+    /// UltraViewer's login proof is a plain MD5 of the password, so a captured
+    /// login keeps working until the password changes. Change it as soon as
+    /// the viewer is gone; sharing restarts so UltraViewer learns it.
+    private func rotatePasswordAfterSession() {
+        guard rotatesPasswordAfterSession else { return }
+        // Restarting now would cancel the approved switch to the other side.
+        guard !isApprovingSideSwitch else { pendingPasswordRotation = true; return }
+        pendingPasswordRotation = false
+        resetPassword()
+    }
+
+    /// Sharing stopped or failed while someone knew the password, so the next
+    /// start must not reuse it.
+    private func discardPasswordIfVisited(_ visited: Bool) {
+        guard visited, rotatesPasswordAfterSession else { return }
+        pendingPasswordRotation = false
+        _ = try? MacRegistrationProfile.loadOrCreate(forHosting: true, regeneratePassword: true)
     }
 
     /// Sets, changes or (with nil) removes the master password. Sharing that

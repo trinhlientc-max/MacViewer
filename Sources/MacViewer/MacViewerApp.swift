@@ -13,6 +13,9 @@ struct MacViewerApp: App {
     @AppStorage(AppLanguage.defaultsKey) private var language = AppLanguage.system.rawValue
 
     init() {
+        // Skipping the relay certificate check is a one-launch escape hatch, so
+        // it can never stay on unnoticed.
+        UserDefaults.standard.removeObject(forKey: FramedTCPTransport.skipCertificateCheckKey)
         let model = ConnectionModel(adapter: NativeUltraViewerAdapter())
         _model = StateObject(wrappedValue: model)
         _agents = StateObject(wrappedValue: AgentBridge(model: model))
@@ -64,6 +67,8 @@ struct MacViewerSettings: View {
     @ObservedObject var agents: AgentBridge
     @AppStorage(MacHostingModel.masterPasswordAutoAcceptKey) private var masterPasswordAutoAccept = false
     @AppStorage(MacHostingModel.autoAcceptAllKey) private var autoAcceptAll = false
+    @AppStorage(MacHostingModel.rotatePasswordKey) private var rotatePassword = true
+    @AppStorage(RemoteScreenNSView.commandAsControlKey) private var commandAsControl = false
     @State private var editingMasterPassword = false
     @State private var confirmMasterPasswordRemoval = false
     @AppStorage(ConnectionModel.rememberPartnersKey) private var rememberPartners = true
@@ -131,6 +136,9 @@ struct MacViewerSettings: View {
                 Toggle("Allow all connections without asking", isOn: $autoAcceptAll)
                 Text("Skips the approval prompt. Anyone with this Mac’s ID and password can see and control it while sharing is on.")
                     .font(.caption).foregroundColor(autoAcceptAll ? .orange : .secondary)
+                Toggle("Change password after each session", isOn: $rotatePassword)
+                Text("When a connection ends, this Mac gets a new password so an old login cannot be reused. Whoever connects next needs the new password.")
+                    .font(.caption).foregroundColor(rotatePassword ? .secondary : .orange)
             }
             Section(header: Text("History")) {
                 Toggle("Remember successfully connected partner IDs", isOn: $rememberPartners)
@@ -164,9 +172,14 @@ struct MacViewerSettings: View {
                 Toggle("Share clipboard with the other computer", isOn: $shareClipboard)
                 Text("Text copied on either computer can be pasted on the other. Applies to new sessions.")
                     .font(.caption).foregroundColor(.secondary)
+                Text("Passwords copied from a password manager are never sent.")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Section(header: Text("Remote screen")) {
                 Toggle("Smooth image scaling", isOn: $smoothScreen)
+                Toggle("Use ⌘ as Ctrl on Windows", isOn: $commandAsControl)
+                Text("⌘C, ⌘V, ⌘Z… act as Ctrl+C, Ctrl+V, Ctrl+Z on the other computer, and ⌃ becomes the Windows key. Turn this off when controlling a Mac.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 Slider(value: $scrollSensitivity, in: 0.25...2, step: 0.25) {
                     Text("Scroll speed")
                 }
@@ -176,6 +189,8 @@ struct MacViewerSettings: View {
                 Toggle("Skip the relay certificate check", isOn: $skipCertificateCheck)
                 Text("Only turn this on if connecting fails with a certificate error. While it is on, someone on your network could pose as the UltraViewer relay and see or change the session.")
                     .font(.caption).foregroundColor(skipCertificateCheck ? .orange : .secondary)
+                Text("Turns itself off when MacViewer quits.")
+                    .font(.caption).foregroundColor(.secondary)
             }
         }
         .groupedForm()
@@ -319,6 +334,7 @@ struct RemoteSessionCommands: Commands {
     @AppStorage(toolbarKey) private var showToolbar = true
     @AppStorage(chatSidebarKey) private var showChat = false
     @AppStorage(RemoteScreenNSView.forwardShortcutsKey) private var forwardShortcuts = true
+    @AppStorage(RemoteScreenNSView.commandAsControlKey) private var commandAsControl = false
     @AppStorage(RemoteDisplayScale.storageKey) private var displayScaleRaw = RemoteDisplayScale.fit.rawValue
 
     private var displayScale: RemoteDisplayScale {
@@ -342,6 +358,8 @@ struct RemoteSessionCommands: Commands {
             Toggle(L("Send Keyboard Shortcuts to Other Computer"), isOn: Binding(
                 get: { forwardShortcuts }, set: { model.releaseRemoteInput(); forwardShortcuts = $0 }))
                 .keyboardShortcut("k", modifiers: [.control, .option, .command])
+            Toggle(L("Use ⌘ as Ctrl on Windows"), isOn: Binding(
+                get: { commandAsControl }, set: { model.releaseRemoteInput(); commandAsControl = $0 }))
             Divider()
             Button(L("All monitors")) { model.selectMonitor(0) }
                 .keyboardShortcut("0", modifiers: [.control, .option, .command])

@@ -170,10 +170,16 @@ public actor FramedTCPTransport {
         }
     }
 
+    /// How long after expiry a relay certificate is still accepted. A relay
+    /// that keeps serving its certificate still guards that key; the key of a
+    /// long-retired certificate may no longer be kept secret.
+    static let expiredCertificateGrace: TimeInterval = 90 * 24 * 60 * 60
+
     /// Requires a trusted chain for `name`. Some UltraViewer relays keep
     /// serving their certificate after it expires, and the Windows client
     /// still connects to them, so an expired certificate is accepted when it
-    /// is otherwise valid: issued by a trusted authority for this name.
+    /// is otherwise valid (issued by a trusted authority for this name) and
+    /// expired within `expiredCertificateGrace`.
     nonisolated static func verify(_ trust: SecTrust, name: String, rejection: CertificateRejection) -> Bool {
         let policy = SecPolicyCreateSSL(true, name as CFString)
         guard SecTrustSetPolicies(trust, policy) == errSecSuccess else {
@@ -187,7 +193,8 @@ public actor FramedTCPTransport {
         var error: CFError?
         if SecTrustEvaluateWithError(trust, &error) { return true }
         let firstReason = error.map(reasonText)
-        guard SecTrustSetOptions(trust, [.allowExpired, .allowExpiredRoot]) == errSecSuccess else {
+        guard expiredWithinGrace(trust),
+              SecTrustSetOptions(trust, [.allowExpired, .allowExpiredRoot]) == errSecSuccess else {
             if UserDefaults.standard.bool(forKey: skipCertificateCheckKey) { return true }
             rejection.reason = firstReason
             return false
@@ -197,6 +204,30 @@ public actor FramedTCPTransport {
         if UserDefaults.standard.bool(forKey: skipCertificateCheckKey) { return true }
         rejection.reason = error.map(reasonText) ?? firstReason
         return false
+    }
+
+    /// True when every certificate in the evaluated chain was still valid at
+    /// some point within the grace period before the evaluation time.
+    nonisolated static func expiredWithinGrace(_ trust: SecTrust) -> Bool {
+        let earliest = Date(timeIntervalSinceReferenceDate: SecTrustGetVerifyTime(trust)) - expiredCertificateGrace
+        var chain: [SecCertificate] = []
+        if #available(macOS 12, *) {
+            chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate] ?? []
+        } else {
+            chain = (0..<SecTrustGetCertificateCount(trust)).compactMap { SecTrustGetCertificateAtIndex(trust, $0) }
+        }
+        return !chain.isEmpty && chain.allSatisfy { certificate in
+            guard let end = notAfter(certificate) else { return false }
+            return end >= earliest
+        }
+    }
+
+    private nonisolated static func notAfter(_ certificate: SecCertificate) -> Date? {
+        let key = kSecOIDX509V1ValidityNotAfter
+        guard let values = SecCertificateCopyValues(certificate, [key] as CFArray, nil) as? [CFString: Any],
+              let entry = values[key] as? [CFString: Any],
+              let seconds = entry[kSecPropertyKeyValue] as? NSNumber else { return nil }
+        return Date(timeIntervalSinceReferenceDate: seconds.doubleValue)
     }
 
     private nonisolated static func reasonText(_ error: CFError) -> String {

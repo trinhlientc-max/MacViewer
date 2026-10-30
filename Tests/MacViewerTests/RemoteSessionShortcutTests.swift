@@ -45,4 +45,16 @@ struct RemoteSessionShortcutTests {
             charactersIgnoringModifiers: "2", isARepeat: false, keyCode: 0x13))
         #expect(RemoteScreenNSView.sessionDigit(for: repeatEvent) == nil)
     }
+
+    @Test("⌘ as Ctrl swaps only the Command and Control keys, on both sides")
+    func commandAsControlKeyCodes() {
+        let swaps: [UInt16: UInt16] = [0x37: 0x3b, 0x36: 0x3e, 0x3b: 0x37, 0x3e: 0x36]
+        for (key, sent) in swaps {
+            #expect(RemoteScreenNSView.remoteModifierKeyCode(key, swapsCommandAndControl: true) == sent)
+            #expect(RemoteScreenNSView.remoteModifierKeyCode(key, swapsCommandAndControl: false) == key)
+        }
+        for other: UInt16 in [0x38, 0x3a, 0x3c, 0x3d, 0x39, 0x00] {
+            #expect(RemoteScreenNSView.remoteModifierKeyCode(other, swapsCommandAndControl: true) == other)
+        }
+    }
 }

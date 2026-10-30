@@ -191,4 +191,17 @@ struct MacRemoteInputEncoderTests {
             == ["8|||512|||4|||1|||2"])
         #expect(legacy.encode(.releaseAll).isEmpty)
     }
+
+    @Test("Caps Lock is sent as a VK_CAPITAL press and release carrying the new lock state")
+    func capsLockKey() {
+        var encoder = MacRemoteInputEncoder(supportsBinaryKeyboard: true)
+        let on = encoder.encode(.key(keyCode: 0x39, characters: nil, pressed: true, modifiers: .capsLock))
+            + encoder.encode(.key(keyCode: 0x39, characters: nil, pressed: false, modifiers: .capsLock))
+        #expect(on == [
+            Data([30, 124, 124, 124, 1, 0x14, 0x3a, 0, 0, 0, 1]),
+            Data([30, 124, 124, 124, 2, 0x14, 0x3a, 0, 0, 0, 1]),
+        ])
+        let off = encoder.encode(.key(keyCode: 0x39, characters: nil, pressed: true, modifiers: []))
+        #expect(off == [Data([30, 124, 124, 124, 1, 0x14, 0x3a, 0, 0, 0, 0])])
+    }
 }

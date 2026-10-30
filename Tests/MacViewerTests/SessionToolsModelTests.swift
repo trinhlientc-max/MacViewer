@@ -164,4 +164,27 @@ struct SessionToolsModelTests {
         #expect(model.clipboardHistory.count == 1)
         model.deactivate()
     }
+
+    @Test("Secrets a password manager marks as concealed or transient are never sent")
+    func clipboardSkipsPasswordManagerSecrets() async throws {
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let defaults = try #require(UserDefaults(suiteName: "SessionToolsModelTests-\(UUID().uuidString)"))
+        defaults.set(true, forKey: SessionToolsModel.shareClipboardKey)
+        let model = SessionToolsModel(pasteboard: board, defaults: defaults)
+        var sent: [String] = []
+        model.activate(sendChat: { _ in }, sendClipboard: { sent.append($0) }, setSharing: { _ in })
+        for _ in 0..<100 where !model.clipboardEnabled { await Task.yield() }
+        #expect(model.clipboardEnabled)
+        for type in SessionToolsModel.privatePasteboardTypes {
+            board.declareTypes([.string, type], owner: nil)
+            board.setString("secret fixture", forType: .string)
+            await model.pollClipboardOnce()
+        }
+        #expect(sent.isEmpty)
+        board.clearContents(); board.setString("plain fixture", forType: .string)
+        await model.pollClipboardOnce()
+        #expect(sent == ["plain fixture"])
+        model.deactivate()
+    }
 }
