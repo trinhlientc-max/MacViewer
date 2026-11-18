@@ -61,7 +61,6 @@ struct RemoteScreenView: NSViewRepresentable {
 
 final class RemoteScreenNSView: NSView {
     static let forwardShortcutsKey = "MacViewer.forwardShortcuts"
-    static let commandAsControlKey = "MacViewer.commandAsControl"
     static let capsLockKeyCode: UInt16 = 0x39
     /// The Caps Lock state last toggled on the peer, assumed to match this
     /// Mac's when the view opens. A toggle made while another window had the
@@ -272,24 +271,6 @@ final class RemoteScreenNSView: NSView {
         UserDefaults.standard.object(forKey: Self.forwardShortcutsKey) as? Bool ?? true
     }
 
-    /// For a Windows peer: ⌘C/⌘V/⌘Z become Ctrl shortcuts there and ⌃ becomes
-    /// the Windows key. Only this Mac's keyboard is swapped, not agent input.
-    private var swapsCommandAndControl: Bool {
-        UserDefaults.standard.bool(forKey: Self.commandAsControlKey)
-    }
-
-    /// The modifier key the peer receives for a physical modifier key.
-    static func remoteModifierKeyCode(_ code: UInt16, swapsCommandAndControl: Bool) -> UInt16 {
-        guard swapsCommandAndControl else { return code }
-        switch code {
-        case 0x37: return 0x3b // Command → Control
-        case 0x36: return 0x3e // RightCommand → RightControl
-        case 0x3b: return 0x37 // Control → Command (Windows key)
-        case 0x3e: return 0x36 // RightControl → RightCommand
-        default: return code
-        }
-    }
-
     private func keepsLocally(_ event: NSEvent) -> Bool {
         event.modifierFlags.contains(.command) && (!forwardsShortcuts || Self.isReservedShortcut(event))
     }
@@ -392,8 +373,7 @@ final class RemoteScreenNSView: NSView {
         if RemoteScreenModifiers.isModifierKeyCode(event.keyCode) {
             let pressed = !modifierKeysDown.contains(event.keyCode)
             if pressed { modifierKeysDown.insert(event.keyCode) } else { modifierKeysDown.remove(event.keyCode) }
-            let code = Self.remoteModifierKeyCode(event.keyCode, swapsCommandAndControl: swapsCommandAndControl)
-            onInput?(.key(keyCode: code, characters: nil, pressed: pressed, modifiers: current))
+            onInput?(.key(keyCode: event.keyCode, characters: nil, pressed: pressed, modifiers: current))
         }
         onInput?(.modifiers(current))
     }
@@ -450,10 +430,9 @@ final class RemoteScreenNSView: NSView {
         if event.modifierFlags.contains(.shift) { result.insert(.shift) }
         let control = event.modifierFlags.contains(.control)
         let command = event.modifierFlags.contains(.command) && forwardsShortcuts
-        let swaps = swapsCommandAndControl
-        if swaps ? command : control { result.insert(.control) }
+        if control { result.insert(.control) }
         if event.modifierFlags.contains(.option) { result.insert(.option) }
-        if swaps ? control : command { result.insert(.command) }
+        if command { result.insert(.command) }
         if event.modifierFlags.contains(.capsLock) { result.insert(.capsLock) }
         return result
     }

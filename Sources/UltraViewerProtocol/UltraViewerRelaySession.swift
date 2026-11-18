@@ -1,9 +1,11 @@
 import Foundation
+import OSLog
 import Darwin
 
 /// Relay session with an optional encrypted LAN candidate. Ordinary partner
 /// Login and complete initialization are required on either selected channel.
 public actor UltraViewerRelaySession {
+    private static let log = Logger(subsystem: "dev.macviewer.app", category: "session")
     public struct Configuration: Sendable {
         public var registration: ClientRegistration.Request
         public var commandHost: String
@@ -55,6 +57,8 @@ public actor UltraViewerRelaySession {
         case clipboard(String)
         case computerAudio(Data)
         case cursor(CursorMessage)
+        /// Round trip of the latest peer ping, in milliseconds.
+        case latency(Double)
         case sideSwitchRequested(RemoteControlCommands.SideSwitchRequest)
         case fileOffer(FileTransferOffer)
         /// Bytes moved so far for a transfer in either direction.
@@ -109,6 +113,9 @@ public actor UltraViewerRelaySession {
         /// The Windows computer sent an explicit end-of-session command.
         case endedByPeer
         case wrongPassword, lookupRejected(Int32), invalidLookupRoute, partnerBlocked
+        /// The ID server answered the registration with command 60, a security
+        /// check (the Windows client's CAPTCHA) that MacViewer cannot show yet.
+        case verificationRequired
         case unsupportedVersion, malformedInitialization, consumerTooSlow, viewOnly
 
         public var errorDescription: String? {
@@ -125,6 +132,7 @@ public actor UltraViewerRelaySession {
             case let .lookupRejected(code): "UltraViewer declined the partner lookup (code \(code))."
             case .invalidLookupRoute: "UltraViewer returned an incomplete partner address."
             case .partnerBlocked: "The Windows computer blocked this connection."
+            case .verificationRequired: UltraViewerVerification.message
             case .unsupportedVersion: "This Windows UltraViewer version is not supported yet."
             case .malformedInitialization: "The Windows computer returned incomplete screen information."
             case .consumerTooSlow: "The remote session could not deliver its status updates."
@@ -218,6 +226,7 @@ public actor UltraViewerRelaySession {
         self.pendingRelayInitialization = nil
         self.relayPingStarted = nil; self.peerPingStarted = nil
         self.heartbeatTicks = 0
+        self.lastDamageRefresh = nil
         self.stallTask?.cancel(); self.stallTask = nil; self.stall = nil
         self.stallRecovering = false
         self.capturedCommands = []
@@ -246,6 +255,18 @@ public actor UltraViewerRelaySession {
 
     /// Renegotiate a complete screen using the established clear-mode Login path.
     /// Retain the authenticated identity, but suspend control until initialization.
+    /// Damaged frames ask for a full screen at most every ten seconds. Frames
+    /// in between are dropped (or drawn without their atlas), never fatal.
+    private static let damageRefreshNanoseconds: UInt64 = 10_000_000_000
+    private var lastDamageRefresh: UInt64?
+
+    private func refreshScreenAfterDamage() async throws {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let last = lastDamageRefresh, now - last < Self.damageRefreshNanoseconds { return }
+        lastDamageRefresh = now
+        try await refreshScreen()
+    }
+
     public func refreshScreen() async throws {
         guard phase == .active else { throw Failure.notConnected }
         let token = generation
@@ -321,15 +342,17 @@ public actor UltraViewerRelaySession {
         guard generation == token, phase == .registering else { return }
         do {
             try emit(.status("Registering this Mac…"))
-            let opened = try await RelayCommandConnection.open(host: config.commandHost, port: config.listenerPort,
+            armDeadline(token, seconds: 45)
+            let opened = try await RelayCommandConnection.openRegistered(host: config.commandHost,
+                port: config.listenerPort,
                 security: .tls(serverName: "ultraviewer", certificateName: "functions3.ultraviewer.net"),
                 initialRequest: RelayHTTPPreamble.request(host: "functions3.ultraviewer.net"),
-                expectsHTTPResponse: true)
+                registration: try config.registration.relayEnvelope(cipher: .desktopServerCommands))
             let transport = opened.transport, stream = opened.stream
             guard generation == token, phase != .closed else { await transport.close(); return }
             commandTransport = transport
             armDeadline(token)
-            try await transport.send(config.registration.relayEnvelope(cipher: .desktopServerCommands))
+            try await consumeCommand(opened.firstFrame, token: token)
             for try await frame in stream {
                 try Task.checkCancellation()
                 guard generation == token, phase != .closed else { return }
@@ -366,7 +389,15 @@ public actor UltraViewerRelaySession {
 
     private func consumeCommand(_ bytes: Data, token: UUID) async throws {
         guard case let .system(payload) = try RelayEnvelope.decode(bytes),
-              let config = configuration else { return }
+              let config = configuration else {
+            Self.log.notice("Command frame without a system payload in phase \(String(describing: self.phase), privacy: .public)")
+            return
+        }
+        // Only the command tag; the rest can carry IDs and addresses.
+        Self.log.notice("Command \(String(decoding: payload.prefix { $0 != 58 }.prefix(4), as: UTF8.self), privacy: .public) in phase \(String(describing: self.phase), privacy: .public)")
+        if phase == .registering, payload.starts(with: Data("60:".utf8)) {
+            throw Failure.verificationRequired
+        }
         if phase == .registering, payload.starts(with: Data("3:".utf8)) {
             let reply = try ClientRegistration.Reply.parse(payload)
             registrationReply = reply
@@ -792,6 +823,8 @@ public actor UltraViewerRelaySession {
         case 0:
             guard phase == .login || phase == .active else { return }
             let initialization = try ModernScreenInitialization.decode(parts: parts)
+            Logger(subsystem: "dev.macviewer.app", category: "screen").notice(
+                "Initialization \(initialization.width)x\(initialization.height) tile \(initialization.tileSize) parts \(parts.count)")
             let geometryChanged = upgradingID != nil || renderer?.width != initialization.width || renderer?.height != initialization.height
             if geometryChanged, parts.count > 13, parts[13].isEmpty { throw Failure.malformedInitialization }
             let version = initialization.targetVersionBytes.map { String(decoding: $0, as: UTF8.self) } ?? ""
@@ -820,9 +853,12 @@ public actor UltraViewerRelaySession {
             diagnostics.peerAccepted = true
             if heartbeat == nil {
                 heartbeat = Task { [weak self] in
+                    // The first ping comes soon so the latency shows right away.
+                    var interval: TimeInterval = 2
                     while !Task.isCancelled {
                         do {
-                            try await Task.sleep(seconds: 10)
+                            try await Task.sleep(seconds: interval)
+                            interval = 10
                             await self?.sendHeartbeat(token)
                         } catch { return }
                     }
@@ -861,6 +897,7 @@ public actor UltraViewerRelaySession {
             diagnostics.screenPayloadBytes += UInt64(payload.count)
             let decodingStarted = DispatchTime.now().uptimeNanoseconds
             do {
+                let skippedBefore = renderer.skippedAtlases
                 let bitmap = try renderer.apply(ModernScreenFrameMessage.decode(parts: parts))
                 let elapsed = DispatchTime.now().uptimeNanoseconds - decodingStarted
                 diagnostics.decodeNanoseconds += elapsed
@@ -870,19 +907,24 @@ public actor UltraViewerRelaySession {
                 // Backpressure follows successful decoding, so a slow client
                 // cannot acknowledge a growing queue of stale screen updates.
                 try await sendToPeer(Data("18".utf8))
+                if renderer.skippedAtlases != skippedBefore {
+                    diagnostics.lastScreenFailure = "auxiliaryAtlasSkipped"
+                    try await refreshScreenAfterDamage()
+                }
             } catch let error as ModernScreenMessageError {
                 diagnostics.lastScreenFailure = String(describing: error)
                 try await sendToPeer(Data("18".utf8))
-                // A malformed drawing mission must not immediately tear down an
+                // A malformed drawing mission must not tear down an
                 // authenticated connection. A new full initialization resets the
                 // decoder and tile cache together; never continue a damaged cache.
-                guard diagnostics.screenRefreshes < 2 else { throw error }
-                try await refreshScreen()
+                try await refreshScreenAfterDamage()
             }
         case 20:
             if let started = peerPingStarted {
-                diagnostics.peerRoundTripMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                diagnostics.peerRoundTripMilliseconds = milliseconds
                 peerPingStarted = nil
+                try? emit(.latency(milliseconds))
             }
         case 23:
             guard phase == .active else { return }
@@ -903,7 +945,11 @@ public actor UltraViewerRelaySession {
         case 27, 41, 54: throw Failure.endedByPeer
         case 39: throw Failure.partnerBlocked
         case 48:
-            if phase == .active { try renderer?.setTileSize(parts: parts) }
+            // Native stores DefaultFrameWidthHeight whenever 48 arrives, also
+            // between a re-login and its initialization.
+            try renderer?.setTileSize(parts: parts)
+            Logger(subsystem: "dev.macviewer.app", category: "screen").notice(
+                "Command 48 tile size \(parts.count > 1 ? Int(parts[1].first ?? 0) : -1), renderer \(self.renderer == nil ? "absent" : "present")")
         case 49:
             guard parts.count > 1, let value = parts[1].first else {
                 throw Failure.malformedInitialization
@@ -1055,6 +1101,7 @@ public actor UltraViewerRelaySession {
     }
 
     private func emit(_ event: Event) throws {
+        if case let .status(text) = event { Self.log.notice("Status: \(text, privacy: .public)") }
         switch events?.yield(event) {
         case .terminated: throw CancellationError()
         case .dropped:
@@ -1071,6 +1118,7 @@ public actor UltraViewerRelaySession {
 
     private func finish(_ error: (any Swift.Error)?) async {
         guard phase != .closed else { return }
+        Self.log.notice("Session ended in phase \(String(describing: self.phase), privacy: .public): \(error.map { String(describing: $0) } ?? "closed", privacy: .public)")
         phase = .closed
         diagnostics.closeReason = error.map { String(describing: $0) }
         files.reset(); fileOutbox.removeAll(); fileSendRevision = UUID(); fileSending = false
@@ -1184,4 +1232,9 @@ public actor UltraViewerRelaySession {
         guard values.count == 3, values.allSatisfy({ $0 >= 0 }) else { return false }
         return !values.lexicographicallyPrecedes(required)
     }
+}
+
+/// Shared by the viewer and host sessions.
+public enum UltraViewerVerification {
+    public static let message = "UltraViewer is asking this Mac for a security check that MacViewer cannot show yet. This can happen after many connections in a short time. Wait a while and try again."
 }

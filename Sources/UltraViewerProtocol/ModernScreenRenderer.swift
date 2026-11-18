@@ -64,6 +64,8 @@ public final class ModernScreenRenderer {
     public let height: Int
     public private(set) var tileSize: Int
     public private(set) var lastFrameNumber: Int32
+    /// Atlases no tile size could place; their regions kept older pixels.
+    public private(set) var skippedAtlases = 0
     public let limits: ModernScreenLimits
 
     private struct CachedRectangle {
@@ -181,7 +183,9 @@ public final class ModernScreenRenderer {
         // IL_0512..0886: JPEG atlas tiles write full color directly to main.
         if !message.auxiliaryRectangles.isEmpty {
             let atlas = try decodeAuxiliaryJPEG(message.auxiliaryJPEG)
+            let skippedBefore = skippedAtlases
             try applyAuxiliary(atlas, rectangles: message.auxiliaryRectangles, to: &next)
+            if skippedAtlases != skippedBefore { dumpSkippedAtlas(message) }
         }
 
         // IL_0995..0d8a: each packed raw rectangle stages at converter (0,0).
@@ -361,10 +365,67 @@ public final class ModernScreenRenderer {
         return AuxiliaryAtlas(width: imageWidth, height: imageHeight, pixels: rgba)
     }
 
+    private struct AtlasPlacement {
+        let sourceX, sourceY, width, height, destinationX, destinationY: Int
+    }
+
     private func applyAuxiliary(_ atlas: AuxiliaryAtlas, rectangles: [ScreenRegion], to state: inout State) throws {
+        let placements: [AtlasPlacement]
+        if let walk = try atlasWalk(atlas, rectangles: rectangles, tileSize: tileSize) {
+            placements = walk.placements
+        } else {
+            // The atlas does not fit the current tile size. Leave those regions as they
+            // were rather than fail the frame; the session asks for a fresh
+            // screen when it sees skippedAtlases grow.
+            Logger(subsystem: "dev.macviewer.app", category: "screen").error(
+                "Atlas skipped: atlas=\(atlas.width)x\(atlas.height) tile=\(self.tileSize) rectangles=\(rectangles.count)")
+            skippedAtlases += 1
+            return
+        }
+        let mainWidth = width
+        atlas.pixels.withUnsafeBytes { (source: UnsafeRawBufferPointer) in
+            state.mainPixels.withUnsafeMutableBytes { (target: UnsafeMutableRawBufferPointer) in
+                for tile in placements {
+                    for row in 0..<tile.height {
+                        // Native TurboJPEG flags1026 are bottom-up. An
+                        // address reversal preserves that order without
+                        // converting/copying the complete decoded atlas.
+                        let sourceOffset = ((atlas.height - 1 - tile.sourceY - row) * atlas.width + tile.sourceX) * 4
+                        let destination = ((tile.destinationY + row) * mainWidth + tile.destinationX) * 4
+                        target.baseAddress!.advanced(by: destination).copyMemory(
+                            from: source.baseAddress!.advanced(by: sourceOffset), byteCount: tile.width * 4)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keeps the first few unplaceable atlases (JPEG plus its rectangle list)
+    /// in Caches/dev.macviewer.app/atlas-dumps so the packing can be studied.
+    private func dumpSkippedAtlas(_ message: ModernScreenFrameMessage) {
+        guard Bundle.main.bundleIdentifier == "dev.macviewer.app",
+              let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return }
+        let directory = caches.appendingPathComponent("dev.macviewer.app/atlas-dumps", isDirectory: true)
+        let existing = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?.count ?? 0
+        guard existing < 10 else { return }
+        let name = "atlas-\(Int(Date().timeIntervalSince1970 * 1000))"
+        let rectangles = message.auxiliaryRectangles.map { [$0.x, $0.y, $0.width, $0.height] }
+        let info: [String: Any] = ["screenWidth": width, "screenHeight": height, "tileSize": tileSize,
+                                   "rectangles": rectangles]
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try message.auxiliaryJPEG.write(to: directory.appendingPathComponent(name + ".jpg"))
+            try JSONSerialization.data(withJSONObject: info)
+                .write(to: directory.appendingPathComponent(name + ".json"))
+        } catch {}
+    }
+
+    /// The recovered atlas cursor, or nil when it leaves the atlas.
+    private func atlasWalk(_ atlas: AuxiliaryAtlas, rectangles: [ScreenRegion], tileSize: Int)
+        throws -> (placements: [AtlasPlacement], lastColumn: Int)? {
+        var placements: [AtlasPlacement] = []
         var sourceColumn = 0
         var sourceY = 0
-        var tileCount = 0
         for rectangle in rectangles {
             guard isInside(rectangle, width: width, height: height) else {
                 throw ModernScreenMessageError.invalidGeometry
@@ -372,10 +433,9 @@ public final class ModernScreenRenderer {
             // Recovered loop order: destination x outside, destination y inside.
             for dx in stride(from: 0, to: rectangle.width, by: tileSize) {
                 for dy in stride(from: 0, to: rectangle.height, by: tileSize) {
-                    guard tileCount < limits.maximumAuxiliaryTiles else {
+                    guard placements.count < limits.maximumAuxiliaryTiles else {
                         throw ModernScreenMessageError.sizeLimitExceeded
                     }
-                    tileCount += 1
                     let tileWidth = min(tileSize, rectangle.width - dx)
                     let tileHeight = min(tileSize, rectangle.height - dy)
                     if sourceY + tileHeight > atlas.height {
@@ -385,28 +445,16 @@ public final class ModernScreenRenderer {
                     let sourceX = try Self.product(sourceColumn, tileSize)
                     guard tileWidth <= atlas.width, tileHeight <= atlas.height,
                           sourceX <= atlas.width - tileWidth, sourceY <= atlas.height - tileHeight else {
-                        Logger(subsystem: "dev.macviewer.app", category: "screen").error(
-                            "Atlas bounds: atlas=\(atlas.width)x\(atlas.height) tile=\(self.tileSize) source=\(sourceX),\(sourceY) size=\(tileWidth)x\(tileHeight) rectangle=\(rectangle.x),\(rectangle.y),\(rectangle.width),\(rectangle.height)")
-                        throw ModernScreenMessageError.auxiliaryAtlasOutOfBounds
+                        return nil
                     }
-                    let mainWidth = width
-                    atlas.pixels.withUnsafeBytes { (source: UnsafeRawBufferPointer) in
-                        state.mainPixels.withUnsafeMutableBytes { (target: UnsafeMutableRawBufferPointer) in
-                            for row in 0..<tileHeight {
-                                // Native TurboJPEG flags1026 are bottom-up. An
-                                // address reversal preserves that order without
-                                // converting/copying the complete decoded atlas.
-                                let sourceOffset = ((atlas.height - 1 - sourceY - row) * atlas.width + sourceX) * 4
-                                let destination = ((rectangle.y + dy + row) * mainWidth + rectangle.x + dx) * 4
-                                target.baseAddress!.advanced(by: destination).copyMemory(
-                                    from: source.baseAddress!.advanced(by: sourceOffset), byteCount: tileWidth * 4)
-                            }
-                        }
-                    }
+                    placements.append(AtlasPlacement(sourceX: sourceX, sourceY: sourceY,
+                        width: tileWidth, height: tileHeight,
+                        destinationX: rectangle.x + dx, destinationY: rectangle.y + dy))
                     sourceY += tileHeight
                 }
             }
         }
+        return (placements, sourceColumn)
     }
 
     private func isInside(_ region: ScreenRegion, width: Int, height: Int) -> Bool {

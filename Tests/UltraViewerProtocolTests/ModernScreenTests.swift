@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 @testable import UltraViewerProtocol
 
@@ -285,14 +287,42 @@ private let screenJPEGFixture = Data(base64Encoded:
 @Test func modernScreenAuxiliaryBoundsAndTileSizeUpdates() throws {
     let renderer = try ModernScreenRenderer(width: 5, height: 1, tileSize: 1, displayColors: 0, lastFrameNumber: 0)
     let overflow = try ModernScreenFrameMessage.decode(parts: screenParts(jpeg: screenJPEGFixture, auxiliary: [0, 0, 5, 1]))
-    #expect(throws: ModernScreenMessageError.auxiliaryAtlasOutOfBounds) { try renderer.apply(overflow) }
-    #expect(renderer.lastFrameNumber == 0)
+    // No tile size places this atlas: the frame applies without it.
+    _ = try renderer.apply(overflow)
+    #expect(renderer.skippedAtlases == 1)
+    #expect(renderer.lastFrameNumber == 1)
     try renderer.setTileSize(parts: [Data([48]), Data([2])])
     #expect(renderer.tileSize == 2)
     #expect(throws: ModernScreenMessageError.malformedPart(1)) {
         try renderer.setTileSize(parts: [Data([48]), Data([0])])
     }
     #expect(renderer.tileSize == 2)
+}
+
+private func solidJPEG(width: Int, height: Int) -> Data {
+    let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+    context.setFillColor(red: 0, green: 1, blue: 0, alpha: 1)
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let data = NSMutableData()
+    let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil)!
+    CGImageDestinationAddImage(destination, context.makeImage()!, nil)
+    CGImageDestinationFinalize(destination)
+    return data as Data
+}
+
+// A 40x32 rectangle packed with 16-pixel tiles fills a 32x48 atlas. Walked
+// with a stale 32-pixel tile size it leaves the atlas: the frame still
+// applies, without guessing another size and drawing tiles in wrong places.
+@Test func modernAtlasThatDoesNotFitIsSkippedNotGuessed() throws {
+    let renderer = try ModernScreenRenderer(width: 40, height: 32, tileSize: 32, displayColors: 0, lastFrameNumber: 0)
+    let message = try ModernScreenFrameMessage.decode(parts: screenParts(
+        jpeg: solidJPEG(width: 32, height: 48), auxiliary: [0, 0, 40, 32]))
+    _ = try renderer.apply(message)
+    #expect(renderer.tileSize == 32)
+    #expect(renderer.skippedAtlases == 1)
+    #expect(renderer.lastFrameNumber == 1)
 }
 
 @Test func modernAtlasHasIndependentDimensionAndPixelBudgets() throws {

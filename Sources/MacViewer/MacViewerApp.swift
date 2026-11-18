@@ -5,9 +5,9 @@ import UltraViewerProtocol
 @main
 struct MacViewerApp: App {
     @StateObject private var model: ConnectionModel
+    @StateObject private var sessions: SessionsModel
     @StateObject private var agents: AgentBridge
     @StateObject private var hosting = MacHostingModel()
-    @StateObject private var capture = RemoteCaptureController()
     @StateObject private var updater = UpdateChecker()
     @NSApplicationDelegateAdaptor(MacViewerAppDelegate.self) private var applicationDelegate
     @AppStorage(AppLanguage.defaultsKey) private var language = AppLanguage.system.rawValue
@@ -17,17 +17,18 @@ struct MacViewerApp: App {
         // it can never stay on unnoticed.
         UserDefaults.standard.removeObject(forKey: FramedTCPTransport.skipCertificateCheckKey)
         let model = ConnectionModel(adapter: NativeUltraViewerAdapter())
+        let sessions = SessionsModel(form: model) { ConnectionModel(adapter: NativeUltraViewerAdapter()) }
         _model = StateObject(wrappedValue: model)
-        _agents = StateObject(wrappedValue: AgentBridge(model: model))
+        _sessions = StateObject(wrappedValue: sessions)
+        _agents = StateObject(wrappedValue: AgentBridge(sessions: sessions))
     }
 
     var body: some Scene {
         WindowGroup("MacViewer") {
-            ConnectionView(model: model, hosting: hosting, remoteCapture: capture, updater: updater, agents: agents)
+            ConnectionView(sessions: sessions, model: model, hosting: hosting, updater: updater, agents: agents)
                 .frame(minWidth: 960, minHeight: 680)
                 .onAppear {
-                    applicationDelegate.capture = capture
-                    applicationDelegate.model = model
+                    applicationDelegate.sessions = sessions
                     applicationDelegate.hosting = hosting
                     applicationDelegate.agents = agents
                     updater.startAutomaticChecks()
@@ -35,6 +36,7 @@ struct MacViewerApp: App {
                 }
                 .appLanguage()
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultWindowSize(width: 1120, height: 800)
         .commands {
             CommandGroup(replacing: .newItem) {}
@@ -42,14 +44,26 @@ struct MacViewerApp: App {
                 Button(L("About MacViewer")) { MacViewerAbout.show() }
                 Button(L("Check for Updates…")) { updater.check(userInitiated: true) }
             }
-            RemoteSessionCommands(model: model)
+            RemoteSessionCommands(sessions: sessions)
             CommandMenu(L("Connection")) {
-                Button(L("Connect")) { model.connect() }
+                Button(L("Connect")) { sessions.connectFromForm() }
                     .keyboardShortcut("k", modifiers: [.command])
                     .disabled(!model.canConnect)
-                Button(L("Disconnect")) { model.disconnect() }
+                Button(L("Disconnect")) { if let session = sessions.selected { sessions.close(session) } }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
-                    .disabled(!model.isSessionActive)
+                    .disabled(sessions.selected?.isSessionActive != true)
+                Divider()
+                Button(L("Home")) { sessions.select(nil) }
+                    .keyboardShortcut("h", modifiers: [.control, .option, .command])
+                Button(L("Next Tab")) { sessions.selectNextTab(1) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.control, .option, .command])
+                    .disabled(sessions.sessions.isEmpty)
+                Button(L("Previous Tab")) { sessions.selectNextTab(-1) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.control, .option, .command])
+                    .disabled(sessions.sessions.isEmpty)
+                Button(L("Close Tab")) { if let session = sessions.selected { sessions.close(session) } }
+                    .keyboardShortcut("w", modifiers: [.control, .option, .command])
+                    .disabled(sessions.selected == nil)
             }
         }
 
@@ -68,7 +82,6 @@ struct MacViewerSettings: View {
     @AppStorage(MacHostingModel.masterPasswordAutoAcceptKey) private var masterPasswordAutoAccept = false
     @AppStorage(MacHostingModel.autoAcceptAllKey) private var autoAcceptAll = false
     @AppStorage(MacHostingModel.rotatePasswordKey) private var rotatePassword = true
-    @AppStorage(RemoteScreenNSView.commandAsControlKey) private var commandAsControl = false
     @State private var editingMasterPassword = false
     @State private var confirmMasterPasswordRemoval = false
     @AppStorage(ConnectionModel.rememberPartnersKey) private var rememberPartners = true
@@ -76,7 +89,7 @@ struct MacViewerSettings: View {
     @AppStorage("MacViewer.scrollSensitivity") private var scrollSensitivity = 1.0
     @AppStorage(AppLanguage.defaultsKey) private var language = AppLanguage.system.rawValue
     @AppStorage(UpdateChecker.automaticKey) private var checkForUpdates = true
-    @AppStorage(SessionToolsModel.shareClipboardKey) private var shareClipboard = false
+    @AppStorage(SessionToolsModel.shareClipboardKey) private var shareClipboard = true
     @AppStorage(MacRegistrationProfile.displayNameKey) private var displayName = ""
     @AppStorage(ReceivedFilesFolder.key) private var receivedFolder = ""
     @AppStorage(FramedTCPTransport.skipCertificateCheckKey) private var skipCertificateCheck = false
@@ -177,9 +190,6 @@ struct MacViewerSettings: View {
             }
             Section(header: Text("Remote screen")) {
                 Toggle("Smooth image scaling", isOn: $smoothScreen)
-                Toggle("Use ⌘ as Ctrl on Windows", isOn: $commandAsControl)
-                Text("⌘C, ⌘V, ⌘Z… act as Ctrl+C, Ctrl+V, Ctrl+Z on the other computer, and ⌃ becomes the Windows key. Turn this off when controlling a Mac.")
-                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 Slider(value: $scrollSensitivity, in: 0.25...2, step: 0.25) {
                     Text("Scroll speed")
                 }
@@ -255,8 +265,7 @@ private struct MasterPasswordSheet: View {
 
 @MainActor
 final class MacViewerAppDelegate: NSObject, NSApplicationDelegate {
-    weak var capture: RemoteCaptureController?
-    weak var model: ConnectionModel?
+    weak var sessions: SessionsModel?
     weak var hosting: MacHostingModel?
     weak var agents: AgentBridge?
     private var isFinishing = false
@@ -275,7 +284,8 @@ final class MacViewerAppDelegate: NSObject, NSApplicationDelegate {
         guard !isFinishing else { return .terminateLater }
         isFinishing = true
         Task {
-            if let capture, capture.isRecording || capture.isFinishingRecording || capture.isPreparingRecording {
+            for capture in sessions?.allCaptures ?? []
+            where capture.isRecording || capture.isFinishingRecording || capture.isPreparingRecording {
                 await capture.stopRecording()
             }
             // Tell the other computer the session is over before the process
@@ -294,7 +304,7 @@ final class MacViewerAppDelegate: NSObject, NSApplicationDelegate {
 
     private func closeConnections() async {
         agents?.shutdown()
-        await model?.shutdown()
+        await sessions?.shutdown()
         await hosting?.shutdown()
     }
 }
@@ -330,11 +340,11 @@ enum MacViewerAbout {
 struct RemoteSessionCommands: Commands {
     static let toolbarKey = "MacViewer.sessionToolbar"
     static let chatSidebarKey = "MacViewer.chatSidebar"
-    @ObservedObject var model: ConnectionModel
+    @ObservedObject var sessions: SessionsModel
+    private var model: ConnectionModel { sessions.current }
     @AppStorage(toolbarKey) private var showToolbar = true
     @AppStorage(chatSidebarKey) private var showChat = false
     @AppStorage(RemoteScreenNSView.forwardShortcutsKey) private var forwardShortcuts = true
-    @AppStorage(RemoteScreenNSView.commandAsControlKey) private var commandAsControl = false
     @AppStorage(RemoteDisplayScale.storageKey) private var displayScaleRaw = RemoteDisplayScale.fit.rawValue
 
     private var displayScale: RemoteDisplayScale {
@@ -358,8 +368,10 @@ struct RemoteSessionCommands: Commands {
             Toggle(L("Send Keyboard Shortcuts to Other Computer"), isOn: Binding(
                 get: { forwardShortcuts }, set: { model.releaseRemoteInput(); forwardShortcuts = $0 }))
                 .keyboardShortcut("k", modifiers: [.control, .option, .command])
-            Toggle(L("Use ⌘ as Ctrl on Windows"), isOn: Binding(
-                get: { commandAsControl }, set: { model.releaseRemoteInput(); commandAsControl = $0 }))
+            Toggle(L("Use ⌘ as Ctrl (Windows)"), isOn: Binding(
+                get: { model.swapCommandControl }, set: { model.setSwapCommandControl($0) }))
+                .keyboardShortcut("s", modifiers: [.control, .option, .command])
+                .disabled(model.phase != .connected)
             Divider()
             Button(L("All monitors")) { model.selectMonitor(0) }
                 .keyboardShortcut("0", modifiers: [.control, .option, .command])
