@@ -603,3 +603,5 @@
 "The Windows computer has enabled view-only access." = "Máy Windows đã bật chế độ chỉ xem.";
 "The UltraViewer service address is invalid." = "Địa chỉ dịch vụ UltraViewer không hợp lệ.";
 "The UltraViewer service address could not be resolved. Check the connection and try again." = "Không phân giải được địa chỉ dịch vụ UltraViewer. Kiểm tra kết nối rồi thử lại.";
+"Agents can run commands and copy files (Windows)" = "Trợ lý được chạy lệnh và chép tệp (Windows)";
+"Runs PowerShell through the Run box and copies files both ways over the shared clipboard, which turns on when needed. Agents can then send any file on this Mac that you can read. Also needs the mouse and keyboard permission." = "Chạy PowerShell qua hộp Run và chép tệp hai chiều qua clipboard dùng chung (tự bật khi cần). Khi bật, trợ lý gửi được mọi tệp trên máy Mac mà bạn đọc được. Cần bật cả quyền dùng chuột và bàn phím.";

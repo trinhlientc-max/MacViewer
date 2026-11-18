@@ -45,6 +45,9 @@ struct AgentSettingsView: View {
                 Toggle("Agents can connect and disconnect", isOn: $agents.allowConnect)
                 Text("Uses the password the agent gives, or one saved in Keychain.")
                     .font(.caption).foregroundColor(.secondary)
+                Toggle("Agents can run commands and copy files (Windows)", isOn: $agents.allowCommands)
+                Text("Runs PowerShell through the Run box and copies files both ways over the shared clipboard, which turns on when needed. Agents can then send any file on this Mac that you can read. Also needs the mouse and keyboard permission.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 Toggle("Ask me before a new agent acts", isOn: $agents.askFirst)
                 if !agents.trustedClients.isEmpty {
                     ForEach(agents.trustedClients, id: \.self) { client in

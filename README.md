@@ -173,6 +173,24 @@ cài đặt của ứng dụng. Ứng dụng khác thì dùng **Sao chép cấu 
 claude mcp add --scope user macviewer -- /Applications/MacViewer.app/Contents/MacOS/macviewer-mcp
 ```
 
+### Chạy lệnh và chép tệp trên máy Windows
+
+Muốn trợ lý tự sửa lỗi nhanh hơn thay vì chỉ bấm chuột theo ảnh chụp, bật thêm
+**Trợ lý được chạy lệnh và chép tệp (Windows)**. Trợ lý sẽ có thêm các công cụ:
+
+- `run_command`: chạy một đoạn PowerShell trên máy kia và đọc kết quả dạng chữ
+  (kèm mã thoát). Dùng `admin: true` để chạy quyền quản trị (máy kia hiện hộp UAC,
+  trợ lý tự chụp màn hình và bấm Có, rồi gọi `command_result`).
+- `get_file`: lấy một tệp (≤ 200 MB, kể cả tệp log đang mở) về `~/Downloads/MacViewer AI`.
+- `put_file`: chép một tệp từ máy Mac tới đường dẫn bất kỳ trên máy kia.
+
+Cách hoạt động: MacViewer đưa đoạn lệnh lên clipboard dùng chung (tự bật khi cần),
+mở **Win+R** và gõ một lệnh ngắn để PowerShell ẩn chạy đúng đoạn lệnh có mã phiên
+đó; kết quả và tệp quay về qua clipboard theo từng phần có xác nhận. Không cần
+cài thêm gì trên máy Windows. Lưu ý: clipboard của máy kia bị ghi đè trong lúc
+chạy; cần màn hình đã mở khoá và không có ứng dụng toàn màn hình đang giữ bàn phím.
+Nội dung trao đổi này không ghi vào clipboard của máy Mac.
+
 - Mặc định tính năng này tắt. Mọi thứ chỉ diễn ra trên máy Mac: công cụ trao đổi
   với ứng dụng qua socket cục bộ mà chỉ tài khoản của bạn mở được.
 - Trợ lý chỉ dùng được chuột, bàn phím khi bạn bật **Điều khiển**. Muốn trợ lý tự

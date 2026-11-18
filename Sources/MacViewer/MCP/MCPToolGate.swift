@@ -16,6 +16,8 @@ enum MCPToolGate {
         var screen = false
         var input = false
         var connect = false
+        /// Run PowerShell and copy files; also needs screen and input.
+        var commands = false
         var stoppedForSession = false
     }
 
@@ -31,10 +33,13 @@ enum MCPToolGate {
     /// Tools that write the shared clipboard on the remote computer.
     static let clipboardWriteTools: Set<String> = ["set_clipboard"]
     static let connectionTools: Set<String> = ["connect", "disconnect"]
+    /// Tools that run PowerShell on the remote computer and read its output.
+    static let commandTools: Set<String> = ["run_command", "command_result", "put_file", "get_file"]
 
     static let screenDenied = "Viewing the screen is turned off in MacViewer › Settings › AI Agents."
     static let inputDenied = "Controlling the remote computer is turned off in MacViewer › Settings › AI Agents."
     static let connectDenied = "Starting or ending connections is turned off. The user can allow it in MacViewer › Settings › AI Agents."
+    static let commandsDenied = "Running commands and copying files is turned off. The user can allow it in MacViewer › Settings › AI Agents."
     static let stoppedForSession = "The user stopped AI agents for this session. They stay stopped until the session ends."
 
     /// Returns the user-facing refusal for `tool`, or nil when it may run.
@@ -46,6 +51,11 @@ enum MCPToolGate {
         }
         if inputTools.contains(tool) || clipboardWriteTools.contains(tool) {
             return permissions.input ? nil : inputDenied
+        }
+        if commandTools.contains(tool) {
+            if !permissions.commands { return commandsDenied }
+            if !permissions.input { return inputDenied }
+            return permissions.screen ? nil : screenDenied
         }
         if connectionTools.contains(tool) {
             return permissions.connect ? nil : connectDenied

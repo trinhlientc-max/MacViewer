@@ -22,6 +22,7 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     static let allowScreenKey = "MacViewer.mcp.allowScreen"
     static let allowInputKey = "MacViewer.mcp.allowInput"
     static let allowConnectKey = "MacViewer.mcp.allowConnect"
+    static let allowCommandsKey = "MacViewer.mcp.allowCommands"
     static let askFirstKey = "MacViewer.mcp.askFirst"
     static let trustedClientsKey = "MacViewer.mcp.trustedClients"
 
@@ -35,6 +36,7 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     @Published var allowScreen: Bool { didSet { defaults.set(allowScreen, forKey: Self.allowScreenKey) } }
     @Published var allowInput: Bool { didSet { defaults.set(allowInput, forKey: Self.allowInputKey) } }
     @Published var allowConnect: Bool { didSet { defaults.set(allowConnect, forKey: Self.allowConnectKey) } }
+    @Published var allowCommands: Bool { didSet { defaults.set(allowCommands, forKey: Self.allowCommandsKey) } }
     @Published var askFirst: Bool { didSet { defaults.set(askFirst, forKey: Self.askFirstKey) } }
     @Published private(set) var trustedClients: [String]
     @Published private(set) var isListening = false
@@ -64,17 +66,23 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     /// Screenshot pixels per remote pixel, per MCP client session, because each
     /// client may request a different screenshot width.
     private var clientScales = MCPClientScale()
+    /// Replies from remote PowerShell scripts, keyed by `MCPRemoteShell.key`.
+    private var shellInbox: [String: String] = [:]
+    /// Channels started in this app run; replies for other ids are dropped.
+    private var shellChannels: [String] = []
 
     init(sessions: SessionsModel, defaults: UserDefaults = .standard, server: MCPSocketServer = MCPSocketServer()) {
         self.sessionList = sessions
         self.defaults = defaults
         self.server = server
         defaults.register(defaults: [Self.enabledKey: false, Self.allowScreenKey: true, Self.allowInputKey: false,
-                                     Self.allowConnectKey: false, Self.askFirstKey: true])
+                                     Self.allowConnectKey: false, Self.allowCommandsKey: false,
+                                     Self.askFirstKey: true])
         isEnabled = defaults.bool(forKey: Self.enabledKey)
         allowScreen = defaults.bool(forKey: Self.allowScreenKey)
         allowInput = defaults.bool(forKey: Self.allowInputKey)
         allowConnect = defaults.bool(forKey: Self.allowConnectKey)
+        allowCommands = defaults.bool(forKey: Self.allowCommandsKey)
         askFirst = defaults.bool(forKey: Self.askFirstKey)
         trustedClients = defaults.stringArray(forKey: Self.trustedClientsKey) ?? []
         server.onConnect = { [weak self] id, program in Task { @MainActor in self?.opened(id, program: program) } }
@@ -220,8 +228,8 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     // MARK: Tools
 
     private var toolPermissions: MCPToolGate.Permissions {
-        MCPToolGate.Permissions(screen: allowScreen, input: allowInput,
-                                connect: allowConnect, stoppedForSession: isStoppedForSession)
+        MCPToolGate.Permissions(screen: allowScreen, input: allowInput, connect: allowConnect,
+                                commands: allowCommands, stoppedForSession: isStoppedForSession)
     }
 
     func callTool(_ name: String, arguments: JSONValue, client: MCPClientInfo) async -> MCPToolResult {
@@ -295,6 +303,10 @@ final class AgentBridge: ObservableObject, MCPToolHost {
             NSPasteboard.general.setString(text, forType: .string)
             await model.tools.pollClipboardOnce()
             return .text("The text is on the shared clipboard. Paste it on the remote computer with press_keys \"ctrl+v\".")
+        case "run_command": return await runCommand(arguments)
+        case "command_result": return await commandResult(arguments)
+        case "put_file": return await putFile(arguments)
+        case "get_file": return await getFile(arguments)
         case "get_clipboard":
             guard let entry = model.tools.clipboardHistory.first(where: { !$0.isOutgoing }) else {
                 return .text("Nothing has been copied on the remote computer in this session.")
@@ -309,14 +321,14 @@ final class AgentBridge: ObservableObject, MCPToolHost {
 
     private func status() -> MCPToolResult {
         .text(Self.statusText(for: model, allowScreen: allowScreen,
-                              allowInput: allowInput, allowConnect: allowConnect))
+                              allowInput: allowInput, allowConnect: allowConnect, allowCommands: allowCommands))
     }
 
     /// The text behind the `session_status` tool. Kept separate so its content
     /// (including `monitorNotice`) is testable without starting the MCP server.
     @MainActor
     static func statusText(for model: ConnectionModel, allowScreen: Bool,
-                           allowInput: Bool, allowConnect: Bool) -> String {
+                           allowInput: Bool, allowConnect: Bool, allowCommands: Bool = false) -> String {
         var lines = ["Phase: \(model.phase.title)"]
         if let info = model.remoteInfo {
             lines.append("Partner: \(info.displayName ?? info.partnerID) (ID \(info.partnerID))")
@@ -332,7 +344,7 @@ final class AgentBridge: ObservableObject, MCPToolHost {
         } else {
             lines.append("Status: \(model.status)")
         }
-        lines.append("Agents may: view screen \(allowScreen ? "yes" : "no"), control \(allowInput ? "yes" : "no"), connect/disconnect \(allowConnect ? "yes" : "no")")
+        lines.append("Agents may: view screen \(allowScreen ? "yes" : "no"), control \(allowInput ? "yes" : "no"), connect/disconnect \(allowConnect ? "yes" : "no"), run commands \(allowCommands ? "yes" : "no")")
         if !model.recentPartners.isEmpty { lines.append("Recent partner IDs: \(model.recentPartners.joined(separator: ", "))") }
         return lines.joined(separator: "\n")
     }
@@ -516,9 +528,217 @@ final class AgentBridge: ObservableObject, MCPToolHost {
         default:
             return .error("Unknown tool \(name).")
         }
-        for event in events { model.send(event) }
+        for event in events { model.sendAgentInput(event) }
         markActing()
         return .text(summary)
+    }
+
+    // MARK: Commands and files (Windows, over the shared clipboard)
+
+    private func runCommand(_ arguments: JSONValue) async -> MCPToolResult {
+        guard let script = arguments["script"]?.stringValue,
+              !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .error("Give the PowerShell script to run.")
+        }
+        let timeout = Double(min(600, max(5, arguments["timeout"]?.intValue ?? 60)))
+        let admin = arguments["admin"]?.boolValue ?? false
+        let id = MCPRemoteShell.newID()
+        if let error = await launch(id: id, script: script, admin: admin) { return .error(error) }
+        let key = MCPRemoteShell.key(id: id, verb: "res", index: nil)
+        switch await waitForShell([key], timeout: admin ? min(timeout, 15) : timeout) {
+        case let .received(_, payload):
+            return Self.commandText(payload)
+        case let .stopped(reason):
+            return .error(reason)
+        case .timedOut:
+            return .text("""
+            No result yet (command_id \(id)). \(admin
+                ? "A Windows UAC prompt is probably waiting: take a screenshot, click Yes, then call command_result."
+                : "It may still be running, or the Run box did not open: take a screenshot, then call command_result.")
+            """)
+        }
+    }
+
+    private func commandResult(_ arguments: JSONValue) async -> MCPToolResult {
+        guard let id = arguments["command_id"]?.stringValue, shellChannels.contains(id) else {
+            return .error("Unknown command_id.")
+        }
+        guard Self.isConnected(model) else { return .error(Self.notConnected) }
+        let timeout = Double(min(600, max(1, arguments["timeout"]?.intValue ?? 30)))
+        switch await waitForShell([MCPRemoteShell.key(id: id, verb: "res", index: nil)], timeout: timeout) {
+        case let .received(_, payload): return Self.commandText(payload)
+        case let .stopped(reason): return .error(reason)
+        case .timedOut: return .text("Still no result for \(id). Take a screenshot to see what is happening.")
+        }
+    }
+
+    private static func isConnected(_ model: ConnectionModel) -> Bool { model.phase == .connected }
+
+    private static func commandText(_ payload: String) -> MCPToolResult {
+        let result = MCPRemoteShell.splitResult(payload)
+        let header = "Exit code: \(result.exitCode.map(String.init) ?? "unknown")"
+        let body = result.output.isEmpty ? "(no output)" : result.output
+        return MCPToolResult(content: [["type": "text", "text": .string(header + "\n" + body)]],
+                             isError: (result.exitCode ?? 0) != 0)
+    }
+
+    private func putFile(_ arguments: JSONValue) async -> MCPToolResult {
+        guard let localPath = arguments["local_path"]?.stringValue, !localPath.isEmpty,
+              let remotePath = arguments["remote_path"]?.stringValue, !remotePath.isEmpty else {
+            return .error("Give local_path (on this Mac) and remote_path (full Windows path).")
+        }
+        let url = URL(fileURLWithPath: (localPath as NSString).expandingTildeInPath)
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]))
+            .flatMap({ $0.isRegularFile == true ? $0.fileSize : nil }) else {
+            return .error("\(url.path) is not a file on this Mac.")
+        }
+        guard size <= MCPRemoteShell.maxFileBytes else { return .error("Files larger than 200 MB are not supported.") }
+        let parts: [String]
+        do { parts = MCPRemoteShell.chunks(try MCPRemoteShell.encode(Data(contentsOf: url))) }
+        catch { return .error("\(url.path) could not be read.") }
+
+        let id = MCPRemoteShell.newID()
+        let script = MCPRemoteShell.putScript(id: id, remotePath: remotePath,
+                                              overwrite: arguments["overwrite"]?.boolValue ?? false)
+        if let error = await launch(id: id, script: script, admin: false) { return .error(error) }
+        let result = MCPRemoteShell.key(id: id, verb: "res", index: nil)
+        var expected = MCPRemoteShell.key(id: id, verb: "ack", index: -1)
+        for (index, part) in parts.enumerated() {
+            switch await waitForShell([expected, result], timeout: index == 0 ? 30 : 60) {
+            case let .received(key, payload) where key == result: return Self.commandText(payload)
+            case .received: break
+            case let .stopped(reason): return .error(reason)
+            case .timedOut:
+                return .error(index == 0
+                    ? "The remote script did not start. Take a screenshot: the Run box may not have opened."
+                    : "The remote computer stopped answering after part \(index) of \(parts.count).")
+            }
+            do { try await model.tools.sendAgentClipboard("MVR-\(id)|put|\(index)|\(parts.count)|\(part)") }
+            catch { return .error("Part \(index + 1) could not be sent over the shared clipboard.") }
+            expected = MCPRemoteShell.key(id: id, verb: "ack", index: index)
+        }
+        switch await waitForShell([result], timeout: 60) {
+        case let .received(_, payload): return Self.commandText(payload)
+        case let .stopped(reason): return .error(reason)
+        case .timedOut: return .error("Sent every part, but the remote script did not confirm. Check with run_command.")
+        }
+    }
+
+    private func getFile(_ arguments: JSONValue) async -> MCPToolResult {
+        guard let remotePath = arguments["remote_path"]?.stringValue, !remotePath.isEmpty else {
+            return .error("Give remote_path, the full path of the file on the Windows computer.")
+        }
+        let id = MCPRemoteShell.newID()
+        if let error = await launch(id: id, script: MCPRemoteShell.getScript(id: id, remotePath: remotePath),
+                                    admin: false) { return .error(error) }
+        let result = MCPRemoteShell.key(id: id, verb: "res", index: nil)
+        var encoded = ""
+        var index = 0, total = 1
+        while index < total {
+            let chunk = MCPRemoteShell.key(id: id, verb: "chunk", index: index)
+            switch await waitForShell([chunk, result], timeout: index == 0 ? 90 : 60) {
+            case let .received(key, payload) where key == result:
+                let failure = Self.commandText(payload)
+                return failure.isError ? failure : .error("The remote script ended before sending the file.")
+            case let .received(_, payload):
+                guard let bar = payload.firstIndex(of: "|"), let count = Int(payload[..<bar]), count > 0 else {
+                    return .error("A damaged part arrived. Try again.")
+                }
+                total = count
+                encoded += payload[payload.index(after: bar)...]
+            case let .stopped(reason): return .error(reason)
+            case .timedOut:
+                return .error(index == 0
+                    ? "The remote script did not start or the file is still being read. Take a screenshot and try again."
+                    : "The remote computer stopped sending after part \(index) of \(total).")
+            }
+            do { try await model.tools.sendAgentClipboard("MVR-\(id)|next|\(index)") }
+            catch { return .error("The transfer could not be acknowledged over the shared clipboard.") }
+            index += 1
+        }
+        let data: Data
+        do { data = try MCPRemoteShell.decode(encoded) } catch { return .error("The received file was damaged. Try again.") }
+        // The bytes come from the remote computer, so they only ever land as a
+        // new file in one folder: never a path the agent chooses, never overwriting.
+        let folder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MacViewer AI", isDirectory: true)
+        let destination = ReceivedFilesFolder.uniqueURL(for: MCPRemoteShell.fileName(ofRemotePath: remotePath), in: folder)
+        do {
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try data.write(to: destination, options: .atomic)
+        } catch { return .error("The file could not be saved to \(destination.path).") }
+        _ = await waitForShell([result], timeout: 5)
+        return .text("Saved \(data.count) bytes to \(destination.path) on this Mac.")
+    }
+
+    private enum ShellWait {
+        case received(key: String, payload: String)
+        case timedOut
+        case stopped(String)
+    }
+
+    private func waitForShell(_ keys: [String], timeout: Double) async -> ShellWait {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            for key in keys {
+                if let payload = shellInbox.removeValue(forKey: key) { return .received(key: key, payload: payload) }
+            }
+            if isStoppedForSession { return .stopped(MCPToolGate.stoppedForSession) }
+            guard model.phase == .connected else { return .stopped("The remote session ended.") }
+            try? await Task.sleep(seconds: 0.1)
+        }
+        return .timedOut
+    }
+
+    private func consumeShellText(_ text: String) -> Bool {
+        guard MCPRemoteShell.isChannelText(text) else { return false }
+        if let message = MCPRemoteShell.Message(parsing: text), shellChannels.contains(message.id),
+           message.verb == "res" || message.verb == "ack" || message.verb == "chunk" {
+            shellInbox[message.key] = message.payload
+        }
+        return true
+    }
+
+    /// Puts the script on the remote clipboard and starts it from the Run box.
+    /// Returns a user-facing error, or nil once the launcher was typed.
+    private func launch(id: String, script: String, admin: Bool) async -> String? {
+        if let refusal = inputRefusal() { return refusal }
+        let tools = model.tools
+        tools.agentClipboardFilter = { [weak self] text in self?.consumeShellText(text) ?? false }
+        if !tools.clipboardEnabled {
+            tools.setClipboardEnabled(true)
+            for _ in 0..<100 {
+                try? await Task.sleep(seconds: 0.1)
+                if tools.clipboardEnabled || !tools.isUpdatingClipboard { break }
+            }
+            guard tools.clipboardEnabled else {
+                return "Clipboard sharing could not be turned on. Ask the user to turn it on in the session toolbar."
+            }
+            record(client: "MacViewer", tool: "clipboard", detail: "Turned on clipboard sharing for AI commands.", isError: false)
+        }
+        shellChannels.append(id)
+        if shellChannels.count > 50 {
+            let dropped = Set(shellChannels.prefix(shellChannels.count - 50))
+            shellChannels.removeFirst(shellChannels.count - 50)
+            shellInbox = shellInbox.filter { entry in !dropped.contains { entry.key.hasPrefix($0 + "|") } }
+        }
+        do { try await tools.sendAgentClipboard(MCPRemoteShell.wrapper(id: id, script: script)) }
+        catch { return "The script could not be sent over the shared clipboard." }
+        try? await Task.sleep(seconds: 0.7)
+        sendKeys("win+r")
+        try? await Task.sleep(seconds: 1.2)
+        sendKeys("ctrl+a")
+        for event in MCPKeys.typingPlan(for: MCPRemoteShell.launcher(id: id)).events { model.sendAgentInput(event) }
+        try? await Task.sleep(seconds: 0.3)
+        sendKeys(admin ? "ctrl+shift+enter" : "enter")
+        markActing()
+        return nil
+    }
+
+    private func sendKeys(_ keys: String) {
+        guard let chords = try? MCPKeys.parse(keys) else { return }
+        for chord in chords { for event in MCPKeys.events(for: chord) { model.sendAgentInput(event) } }
     }
 
     private func markActing() {

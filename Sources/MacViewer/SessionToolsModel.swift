@@ -231,8 +231,22 @@ final class SessionToolsModel: ObservableObject {
         }
     }
 
+    /// Lets the AI command channel take the clipboard texts it exchanges with
+    /// the remote computer, so they never land on this Mac's clipboard.
+    var agentClipboardFilter: (@MainActor (String) -> Bool)?
+
+    /// Sends text to the remote clipboard without touching this Mac's clipboard.
+    func sendAgentClipboard(_ text: String) async throws {
+        guard isActive, clipboardEnabled, let sendClipboard else { throw AgentClipboardError.unavailable }
+        guard text.utf16.count <= 524_288 else { throw AgentClipboardError.tooLarge }
+        try await sendClipboard(text)
+    }
+
+    enum AgentClipboardError: Error { case unavailable, tooLarge }
+
     func receiveClipboard(_ text: String) {
         guard isActive, clipboardEnabled, text.utf16.count <= 524_288 else { return }
+        if agentClipboardFilter?(text) == true { return }
         latestClipboardText = text
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)

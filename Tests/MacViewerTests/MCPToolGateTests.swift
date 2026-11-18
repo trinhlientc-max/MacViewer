@@ -12,7 +12,22 @@ struct MCPToolGateTests {
     private var allTools: [String] {
         let screen = Array(MCPToolGate.readTools) + Array(MCPToolGate.viewTools)
         let control = Array(MCPToolGate.inputTools) + Array(MCPToolGate.clipboardWriteTools)
-        return screen + control + Array(MCPToolGate.connectionTools)
+        return screen + control + Array(MCPToolGate.connectionTools) + Array(MCPToolGate.commandTools)
+    }
+
+    @Test("Commands need their own permission plus control and screen")
+    func commandTools() {
+        for tool in MCPToolGate.commandTools {
+            let all = MCPToolGate.Permissions(screen: true, input: true, connect: true)
+            #expect(MCPToolGate.refusal(tool: tool, permissions: all) == MCPToolGate.commandsDenied, "\(tool)")
+            var allowed = all; allowed.commands = true
+            #expect(MCPToolGate.refusal(tool: tool, permissions: allowed) == nil, "\(tool)")
+            var noInput = allowed; noInput.input = false
+            #expect(MCPToolGate.refusal(tool: tool, permissions: noInput) == MCPToolGate.inputDenied, "\(tool)")
+            var noScreen = allowed; noScreen.screen = false
+            #expect(MCPToolGate.refusal(tool: tool, permissions: noScreen) == MCPToolGate.screenDenied, "\(tool)")
+        }
+        #expect(MCPToolGate.commandTools.isSubset(of: MCPTools.names))
     }
 
     @Test("Every tool needs its own permission; session_status is always readable")
@@ -45,7 +60,8 @@ struct MCPToolGateTests {
 
     @Test("Stop refuses every tool except session_status for the rest of the session")
     func stickyStop() {
-        let stopped = permissions(screen: true, input: true, connect: true, stopped: true)
+        var stopped = permissions(screen: true, input: true, connect: true, stopped: true)
+        stopped.commands = true
         for tool in allTools {
             #expect(MCPToolGate.refusal(tool: tool, permissions: stopped) == MCPToolGate.stoppedForSession, "\(tool)")
         }

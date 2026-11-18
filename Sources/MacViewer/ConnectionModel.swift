@@ -293,7 +293,13 @@ final class ConnectionModel: ObservableObject {
         controlEnabled = enabled
     }
 
-    func send(_ input: RemoteInput) {
+    func send(_ input: RemoteInput) { send(input, fromAgent: false) }
+
+    /// Agent input already names the Windows keys it means (win+r, ctrl+c), so
+    /// the ⌘-as-Ctrl swap, which is for this Mac's keyboard, must not touch it.
+    func sendAgentInput(_ input: RemoteInput) { send(input, fromAgent: true) }
+
+    private func send(_ input: RemoteInput, fromAgent: Bool) {
         guard phase == .connected, controlEnabled else { return }
         let translated: RemoteInput
         if let region = selectedRegion {
@@ -306,7 +312,7 @@ final class ConnectionModel: ObservableObject {
             default: translated = input
             }
         } else { translated = input }
-        enqueueInput(swapCommandControl ? translated.sendingCommandAsControl() : translated)
+        enqueueInput(swapCommandControl && !fromAgent ? translated.sendingCommandAsControl() : translated)
     }
 
     func setSwapCommandControl(_ enabled: Bool) {

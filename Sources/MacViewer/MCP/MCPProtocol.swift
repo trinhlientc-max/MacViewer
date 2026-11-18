@@ -108,7 +108,11 @@ enum MCPTools {
     user opened in the MacViewer app on this Mac. Typical loop: session_status → screenshot → click/type_text/press_keys \
     → screenshot to check the result. Mouse coordinates are pixels in the most recent screenshot image. \
     Input only works while the user has Control switched on in the session window; if it is off, ask the user to turn it on. \
-    The ⌘/win key name sends the Windows key. Tools are refused while the user has Stopped AI agents for the session,     or when the permission the tool needs is turned off.
+    The ⌘/win key name sends the Windows key. Tools are refused while the user has Stopped AI agents for the session, \
+    or when the permission the tool needs is turned off. \
+    On a Windows computer, prefer run_command (PowerShell, text output) over clicking through settings or reading \
+    text off screenshots, and use get_file/put_file to read logs or copy fixes. Take one screenshot first to make sure \
+    the desktop is unlocked and no full-screen app has focus, because run_command types into the Win+R box.
     """
 
     static var names: Set<String> { Set(definitions.compactMap { $0["name"]?.stringValue }) }
@@ -201,6 +205,34 @@ enum MCPTools {
         tool("set_clipboard", "Set remote clipboard",
              "Puts text on the shared clipboard so it can be pasted on the remote computer (clipboard sharing must be on). Requires the control permission.",
              properties: [("text", string("Text to share."))], required: ["text"]),
+        tool("run_command", "Run PowerShell",
+             "Windows only. Runs a PowerShell script on the remote computer and returns its text output and exit code. " +
+             "MacViewer opens Win+R, starts a hidden PowerShell and passes the script over the shared clipboard (turned on " +
+             "automatically). Output is cut to the last 400,000 characters. Do not call exit; throw on failure instead. " +
+             "The remote clipboard is overwritten. With admin=true Windows shows a UAC prompt: the tool returns a command_id, " +
+             "take a screenshot, click Yes, then call command_result. Needs the run-commands permission.",
+             properties: [("script", string("PowerShell script.")),
+                          ("timeout", integer("Seconds to wait for the result. Default 60, at most 600.", minimum: 5)),
+                          ("admin", ["type": "boolean", "description": "Run elevated (UAC prompt). Default false."])],
+             required: ["script"], destructive: true),
+        tool("command_result", "Command result",
+             "Waits for the result of a run_command that returned a command_id.",
+             properties: [("command_id", string("The command_id from run_command.")),
+                          ("timeout", integer("Seconds to wait. Default 30.", minimum: 1))],
+             required: ["command_id"], readOnly: true),
+        tool("get_file", "Copy file from remote",
+             "Windows only. Copies a file (at most 200 MB) from the remote computer to this Mac over the shared clipboard and " +
+             "saves it as a new file in ~/Downloads/MacViewer AI, returning the path. Files that are open in another app can be read.",
+             properties: [("remote_path", string("Full Windows path, e.g. C:\\Users\\An\\AppData\\Roaming\\App\\logs\\main.log.")),
+],
+             required: ["remote_path"]),
+        tool("put_file", "Copy file to remote",
+             "Windows only. Copies a file (at most 200 MB) from this Mac to a full path on the remote computer over the shared " +
+             "clipboard, creating folders as needed. Use run_command with admin=true afterwards to move it into protected folders.",
+             properties: [("local_path", string("Path of the file on this Mac.")),
+                          ("remote_path", string("Full destination path on Windows, including the file name.")),
+                          ("overwrite", ["type": "boolean", "description": "Replace an existing file. Default false."])],
+             required: ["local_path", "remote_path"], destructive: true),
         tool("get_clipboard", "Get remote clipboard",
              "Returns the latest text copied on the remote computer during this session. Requires the view-screen permission.", readOnly: true),
     ]
