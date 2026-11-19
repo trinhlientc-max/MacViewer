@@ -14,6 +14,28 @@ struct AgentActivity: Identifiable, Equatable {
     let isError: Bool
 }
 
+/// The MCP client a tool call is running for (set around `AgentBridge.run`),
+/// so every helper acts on that client's own remote computer.
+enum AgentCallContext {
+    @TaskLocal static var client: UUID?
+}
+
+/// A session an agent is attached to, without keeping a closed tab alive.
+struct WeakConnection {
+    weak var model: ConnectionModel?
+}
+
+/// The support windows MacViewer opened on one remote computer.
+struct ConsoleWindows {
+    var normal: String?
+    var admin: String?
+}
+
+struct ShellFailure: Error {
+    let message: String
+    init(_ message: String) { self.message = message }
+}
+
 /// Lets AI agents use the current remote session through MCP. Off by default;
 /// every tool respects the permissions chosen in Settings › AI Agents.
 @MainActor
@@ -50,8 +72,21 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     @Published private(set) var isStoppedForSession = false
 
     private let sessionList: SessionsModel
-    /// Agents act on the shown tab, else the newest session.
-    private var model: ConnectionModel { sessionList.current }
+    /// Each agent stays on the computer it first worked on (or last chose with
+    /// `connect`), whatever tab the user shows, so several agents can support
+    /// several computers at once without taking each other's sessions.
+    private var bindings: [UUID: WeakConnection] = [:]
+    private var model: ConnectionModel {
+        guard let token = AgentCallContext.client else { return sessionList.current }
+        if let bound = bindings[token] {
+            if let model = bound.model, sessionList.sessions.contains(where: { $0 === model }) { return model }
+            // Its session was closed: never fall through to another computer.
+            return sessionList.form
+        }
+        let model = sessionList.current
+        if model.isSessionActive { bindings[token] = WeakConnection(model: model) }
+        return model
+    }
     private let defaults: UserDefaults
     private let server: MCPSocketServer
     private var sessions: [MCPSocketServer.ConnectionID: MCPSession] = [:]
@@ -70,6 +105,18 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     private var shellInbox: [String: String] = [:]
     /// Channels started in this app run; replies for other ids are dropped.
     private var shellChannels: [String] = []
+    /// Support windows (by their loop id) opened in this app run.
+    private var consoleChannels: Set<String> = []
+    /// The visible support windows open on each remote computer.
+    private var consoles: [ObjectIdentifier: ConsoleWindows] = [:]
+    /// Support window → command it is still running, and the reverse.
+    private var consoleBusy: [String: String] = [:]
+    private var commandWindow: [String: String] = [:]
+    /// Command ids that answered anything (pickup, ack, chunk or result), and
+    /// those that finished. A result can be taken from the inbox by a waiting
+    /// caller before `dispatch` looks, so finishing is remembered here.
+    private var heardFrom: Set<String> = []
+    private var finished: Set<String> = []
 
     init(sessions: SessionsModel, defaults: UserDefaults = .standard, server: MCPSocketServer = MCPSocketServer()) {
         self.sessionList = sessions
@@ -139,6 +186,7 @@ final class AgentBridge: ObservableObject, MCPToolHost {
 
     private func closed(_ id: MCPSocketServer.ConnectionID) {
         let token = sessions[id]?.client.sessionToken
+        if let token { bindings[token] = nil }
         queues.removeValue(forKey: id)?.finish()
         sessions[id] = nil
         connectedClients[id] = nil
@@ -247,7 +295,9 @@ final class AgentBridge: ObservableObject, MCPToolHost {
             record(client: client.name, tool: name, detail: refusal, isError: true)
             return .error(refusal)
         }
-        let result = await run(name, arguments, client: client)
+        let result = await AgentCallContext.$client.withValue(client.sessionToken) {
+            await run(name, arguments, client: client)
+        }
         let detail = result.content.first?["text"]?.stringValue.map { String($0.prefix(140)) } ?? ""
         record(client: client.name, tool: name, detail: detail, isError: result.isError)
         return result
@@ -320,8 +370,22 @@ final class AgentBridge: ObservableObject, MCPToolHost {
     private static let notConnected = "MacViewer is not connected to a remote computer. Ask the user to connect, or use connect."
 
     private func status() -> MCPToolResult {
-        .text(Self.statusText(for: model, allowScreen: allowScreen,
-                              allowInput: allowInput, allowConnect: allowConnect, allowCommands: allowCommands))
+        var text = Self.statusText(for: model, allowScreen: allowScreen,
+                                   allowInput: allowInput, allowConnect: allowConnect, allowCommands: allowCommands)
+        let mine = model
+        let open = sessionList.activeSessions.map { session -> String in
+            let name = session.remoteInfo?.displayName ?? session.partnerID
+            let id = session.remoteInfo?.partnerID ?? session.partnerID
+            return "\(name) (ID \(id))" + (session === mine ? " ← this agent" : "")
+        }
+        if !open.isEmpty {
+            text += "\nOpen sessions: " + open.joined(separator: "; ") +
+                "\nThis agent always acts on its own session above; use connect with another partner ID to switch."
+        }
+        if mine === sessionList.form, let token = AgentCallContext.client, bindings[token] != nil {
+            text += "\nThis agent's session was closed. Use connect to start or join a session."
+        }
+        return .text(text)
     }
 
     /// The text behind the `session_status` tool. Kept separate so its content
@@ -354,9 +418,11 @@ final class AgentBridge: ObservableObject, MCPToolHost {
         let identifier = (arguments["partner_id"]?.stringValue ?? "").filter { !$0.isWhitespace && $0 != "-" }
         guard !identifier.isEmpty else { return .error("Give the partner ID.") }
         guard let model = sessionList.connect(partnerID: identifier,
-                                           password: arguments["password"]?.stringValue ?? "") else {
+                                           password: arguments["password"]?.stringValue ?? "",
+                                           showExisting: false) else {
             return .error(L(sessionList.formError ?? "No password is saved for \(identifier) on this Mac. Pass the password."))
         }
+        if let token = AgentCallContext.client { bindings[token] = WeakConnection(model: model) }
         for _ in 0..<450 where model.phase == .connecting {
             try? await Task.sleep(seconds: 0.1)
         }
@@ -542,8 +608,10 @@ final class AgentBridge: ObservableObject, MCPToolHost {
         }
         let timeout = Double(min(600, max(5, arguments["timeout"]?.intValue ?? 60)))
         let admin = arguments["admin"]?.boolValue ?? false
+        let note = arguments["note"]?.stringValue.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+            ?? MCPRemoteShell.defaultNote
         let id = MCPRemoteShell.newID()
-        if let error = await launch(id: id, script: script, admin: admin) { return .error(error) }
+        if let error = await launch(id: id, script: script, admin: admin, note: note) { return .error(error) }
         let key = MCPRemoteShell.key(id: id, verb: "res", index: nil)
         switch await waitForShell([key], timeout: admin ? min(timeout, 15) : timeout) {
         case let .received(_, payload):
@@ -553,8 +621,8 @@ final class AgentBridge: ObservableObject, MCPToolHost {
         case .timedOut:
             return .text("""
             No result yet (command_id \(id)). \(admin
-                ? "A Windows UAC prompt is probably waiting: take a screenshot, click Yes, then call command_result."
-                : "It may still be running, or the Run box did not open: take a screenshot, then call command_result.")
+                ? "Windows is probably asking (UAC) to open the administrator support window: take a screenshot, click Yes, then call command_result."
+                : "It is still running in the support window: call command_result to keep waiting (tell the person how long with send_chat if it takes a while).")
             """)
         }
     }
@@ -600,7 +668,9 @@ final class AgentBridge: ObservableObject, MCPToolHost {
         let id = MCPRemoteShell.newID()
         let script = MCPRemoteShell.putScript(id: id, remotePath: remotePath,
                                               overwrite: arguments["overwrite"]?.boolValue ?? false)
-        if let error = await launch(id: id, script: script, admin: false) { return .error(error) }
+        let name = MCPRemoteShell.fileName(ofRemotePath: remotePath)
+        if let error = await launch(id: id, script: script, admin: false,
+                                    note: "Đang chép tệp vào máy: \(name) / Copying a file to this computer") { return .error(error) }
         let result = MCPRemoteShell.key(id: id, verb: "res", index: nil)
         var expected = MCPRemoteShell.key(id: id, verb: "ack", index: -1)
         for (index, part) in parts.enumerated() {
@@ -629,8 +699,11 @@ final class AgentBridge: ObservableObject, MCPToolHost {
             return .error("Give remote_path, the full path of the file on the Windows computer.")
         }
         let id = MCPRemoteShell.newID()
-        if let error = await launch(id: id, script: MCPRemoteShell.getScript(id: id, remotePath: remotePath),
-                                    admin: false) { return .error(error) }
+        let name = MCPRemoteShell.fileName(ofRemotePath: remotePath)
+        if let error = await launch(id: id, script: MCPRemoteShell.getScript(id: id, remotePath: remotePath), admin: false,
+                                    note: "Đang gửi tệp cho kỹ thuật viên xem: \(name) / Sending a file to the technician") {
+            return .error(error)
+        }
         let result = MCPRemoteShell.key(id: id, verb: "res", index: nil)
         var encoded = ""
         var index = 0, total = 1
@@ -693,16 +766,37 @@ final class AgentBridge: ObservableObject, MCPToolHost {
 
     private func consumeShellText(_ text: String) -> Bool {
         guard MCPRemoteShell.isChannelText(text) else { return false }
-        if let message = MCPRemoteShell.Message(parsing: text), shellChannels.contains(message.id),
+        if let message = MCPRemoteShell.Message(parsing: text),
+           shellChannels.contains(message.id) || consoleChannels.contains(message.id),
            message.verb == "res" || message.verb == "ack" || message.verb == "chunk" {
             shellInbox[message.key] = message.payload
+            heardFrom.insert(message.id)
+            if message.verb == "res" {
+                finished.insert(message.id)
+                if let sid = commandWindow.removeValue(forKey: message.id) { consoleBusy[sid] = nil }
+            }
         }
         return true
     }
 
-    /// Puts the script on the remote clipboard and starts it from the Run box.
-    /// Returns a user-facing error, or nil once the launcher was typed.
-    private func launch(id: String, script: String, admin: Bool) async -> String? {
+    /// Runs `script` in this computer's visible support window, opening one
+    /// first when needed. Returns a user-facing error, or nil once the window
+    /// picked the command up (or, for `admin`, once the elevated run started
+    /// in the background: its result arrives under `id` for command_result).
+    private func launch(id: String, script: String, admin: Bool, note: String) async -> String? {
+        if let error = await prepareChannel() { return error }
+        register(id)
+        if admin {
+            Task { [weak self] in
+                guard let self, let error = await self.runElevated(id: id, script: script, note: note) else { return }
+                self.shellInbox[MCPRemoteShell.key(id: id, verb: "res", index: nil)] = "EXIT=1\n" + error
+            }
+            return nil
+        }
+        return await runInConsole(id: id, script: script, note: note)
+    }
+
+    private func prepareChannel() async -> String? {
         if let refusal = inputRefusal() { return refusal }
         let tools = model.tools
         tools.agentClipboardFilter = { [weak self] text in self?.consumeShellText(text) ?? false }
@@ -717,23 +811,134 @@ final class AgentBridge: ObservableObject, MCPToolHost {
             }
             record(client: "MacViewer", tool: "clipboard", detail: "Turned on clipboard sharing for AI commands.", isError: false)
         }
+        return nil
+    }
+
+    private func register(_ id: String) {
         shellChannels.append(id)
         if shellChannels.count > 50 {
             let dropped = Set(shellChannels.prefix(shellChannels.count - 50))
             shellChannels.removeFirst(shellChannels.count - 50)
             shellInbox = shellInbox.filter { entry in !dropped.contains { entry.key.hasPrefix($0 + "|") } }
+            heardFrom.subtract(dropped)
+            finished.subtract(dropped)
         }
-        do { try await tools.sendAgentClipboard(MCPRemoteShell.wrapper(id: id, script: script)) }
-        catch { return "The script could not be sent over the shared clipboard." }
+    }
+
+    private func runInConsole(id: String, script: String, note: String) async -> String? {
+        let key = ObjectIdentifier(model)
+        for _ in 0..<2 {
+            let sid: String
+            if let open = consoles[key]?.normal {
+                sid = open
+            } else {
+                switch await openConsole() {
+                case let .success(new): sid = new
+                case let .failure(error): return error.message
+                }
+            }
+            switch await dispatch(id: id, sid: sid, note: note, script: script) {
+            case .picked: return nil
+            case let .failed(error): return error
+            case .notPicked: consoles[key]?.normal = nil // The window was closed: open a new one.
+            }
+        }
+        return "The PowerShell support window did not take the command. Take a screenshot to see what has focus."
+    }
+
+    /// Opens the visible support window: Win+R → `powershell`, then starts the
+    /// loop in it. Waits until the loop reports ready.
+    private func openConsole() async -> Result<String, ShellFailure> {
+        let sid = MCPRemoteShell.newID()
+        consoleChannels.insert(sid)
+        do { try await model.tools.sendAgentClipboard(MCPRemoteShell.consoleScript(sid: sid, admin: false)) }
+        catch { return .failure(ShellFailure("The support script could not be sent over the shared clipboard.")) }
         try? await Task.sleep(seconds: 0.7)
         sendKeys("win+r")
         try? await Task.sleep(seconds: 1.2)
         sendKeys("ctrl+a")
-        for event in MCPKeys.typingPlan(for: MCPRemoteShell.launcher(id: id)).events { model.sendAgentInput(event) }
+        typeText(MCPRemoteShell.consoleCommand)
         try? await Task.sleep(seconds: 0.3)
-        sendKeys(admin ? "ctrl+shift+enter" : "enter")
+        sendKeys("enter")
         markActing()
-        return nil
+        // A new console buffers what is typed until its prompt is ready.
+        try? await Task.sleep(seconds: 2.5)
+        typeText(MCPRemoteShell.bootLine(sid: sid))
+        try? await Task.sleep(seconds: 0.3)
+        sendKeys("enter")
+        switch await waitForShell([MCPRemoteShell.key(id: sid, verb: "ack", index: -9)], timeout: 30) {
+        case .received:
+            consoles[ObjectIdentifier(model), default: ConsoleWindows()].normal = sid
+            return .success(sid)
+        case let .stopped(reason): return .failure(ShellFailure(reason))
+        case .timedOut:
+            return .failure(ShellFailure("The PowerShell support window did not start. Take a screenshot: the Run box or " +
+                                         "the window may not have opened, or another window took the keyboard."))
+        }
+    }
+
+    private enum Pickup { case picked, notPicked, failed(String) }
+
+    /// Hands one command to support window `sid` and waits until it is picked up.
+    private func dispatch(id: String, sid: String, note: String, script: String) async -> Pickup {
+        if let running = consoleBusy[sid] {
+            return .failed("Command \(running) is still running in the support window. Wait for it with command_result, " +
+                           "or ask the person to close that window, then try again.")
+        }
+        do { try await model.tools.sendAgentClipboard(MCPRemoteShell.command(id: id, sid: sid, note: note, script: script)) }
+        catch { return .failed("The script could not be sent over the shared clipboard.") }
+        // Any reply for this id means the window took it: a fast script can
+        // overwrite the pickup signal on the clipboard before this Mac sees it.
+        let deadline = Date().addingTimeInterval(12)
+        while Date() < deadline {
+            if heardFrom.contains(id) {
+                if !finished.contains(id) {
+                    consoleBusy[sid] = id
+                    commandWindow[id] = sid
+                }
+                markActing()
+                return .picked
+            }
+            if isStoppedForSession { return .failed(MCPToolGate.stoppedForSession) }
+            guard model.phase == .connected else { return .failed("The remote session ended.") }
+            try? await Task.sleep(seconds: 0.1)
+        }
+        return .notPicked
+    }
+
+    /// Admin commands run in a second, elevated support window, opened from the
+    /// normal one with Start-Process -Verb RunAs (Windows asks with UAC).
+    private func runElevated(id: String, script: String, note: String) async -> String? {
+        let key = ObjectIdentifier(model)
+        if let sid = consoles[key]?.admin {
+            switch await dispatch(id: id, sid: sid, note: note, script: script) {
+            case .picked: return nil
+            case let .failed(error): return error
+            case .notPicked: consoles[key]?.admin = nil
+            }
+        }
+        let adminSid = MCPRemoteShell.newID()
+        consoleChannels.insert(adminSid)
+        let elevate = MCPRemoteShell.newID()
+        register(elevate)
+        if let error = await runInConsole(id: elevate, script: MCPRemoteShell.elevateScript(adminSid: adminSid),
+                                          note: "Mở cửa sổ quản trị: Windows sẽ hỏi, bấm Có / Opening an administrator window: click Yes") {
+            return error
+        }
+        switch await waitForShell([MCPRemoteShell.key(id: adminSid, verb: "ack", index: -9)], timeout: 180) {
+        case .received: consoles[key, default: ConsoleWindows()].admin = adminSid
+        case let .stopped(reason): return reason
+        case .timedOut: return "The administrator PowerShell window did not open: the UAC prompt was declined or not answered."
+        }
+        switch await dispatch(id: id, sid: adminSid, note: note, script: script) {
+        case .picked: return nil
+        case let .failed(error): return error
+        case .notPicked: return "The administrator support window did not take the command. Take a screenshot."
+        }
+    }
+
+    private func typeText(_ text: String) {
+        for event in MCPKeys.typingPlan(for: text).events { model.sendAgentInput(event) }
     }
 
     private func sendKeys(_ keys: String) {

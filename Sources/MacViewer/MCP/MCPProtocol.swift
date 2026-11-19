@@ -112,7 +112,12 @@ enum MCPTools {
     or when the permission the tool needs is turned off. \
     On a Windows computer, prefer run_command (PowerShell, text output) over clicking through settings or reading \
     text off screenshots, and use get_file/put_file to read logs or copy fixes. Take one screenshot first to make sure \
-    the desktop is unlocked and no full-screen app has focus, because run_command types into the Win+R box.
+    the desktop is unlocked and no full-screen app has focus: the first run_command opens a visible PowerShell support \
+    window with Win+R, and later ones reuse it. The person at the computer watches that window, so give every run_command \
+    a short note in their language saying what it does. Keep them informed: before anything that takes more than a few \
+    seconds, send_chat how long to wait, and never leave them waiting long without a message. \
+    Several agents can work at once: each agent stays on its own session (the one it connected to, or the tab shown \
+    when it first acted), whatever tab the user shows; connect with another partner ID to switch.
     """
 
     static var names: Set<String> { Set(definitions.compactMap { $0["name"]?.stringValue }) }
@@ -207,11 +212,15 @@ enum MCPTools {
              properties: [("text", string("Text to share."))], required: ["text"]),
         tool("run_command", "Run PowerShell",
              "Windows only. Runs a PowerShell script on the remote computer and returns its text output and exit code. " +
-             "MacViewer opens Win+R, starts a hidden PowerShell and passes the script over the shared clipboard (turned on " +
-             "automatically). Output is cut to the last 400,000 characters. Do not call exit; throw on failure instead. " +
-             "The remote clipboard is overwritten. With admin=true Windows shows a UAC prompt: the tool returns a command_id, " +
-             "take a screenshot, click Yes, then call command_result. Needs the run-commands permission.",
+             "The script runs in a visible PowerShell support window that MacViewer opens once (Win+R → powershell) and " +
+             "reuses; the person at the computer sees the note, the script and the result there. The script travels over the " +
+             "shared clipboard (turned on automatically), which is overwritten. Output is cut to the last 400,000 characters. " +
+             "Do not call exit; throw on failure instead. With admin=true a second, elevated support window is opened the first " +
+             "time and Windows shows a UAC prompt: the tool returns a command_id, take a screenshot, click Yes, then call " +
+             "command_result. Needs the run-commands permission.",
              properties: [("script", string("PowerShell script.")),
+                          ("note", string("Short message for the person at the computer, in their language, shown in the support " +
+                                          "window while this runs, e.g. \"Đang kiểm tra cấu hình máy, vui lòng đợi khoảng 1 phút\".")),
                           ("timeout", integer("Seconds to wait for the result. Default 60, at most 600.", minimum: 5)),
                           ("admin", ["type": "boolean", "description": "Run elevated (UAC prompt). Default false."])],
              required: ["script"], destructive: true),

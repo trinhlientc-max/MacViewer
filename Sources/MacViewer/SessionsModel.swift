@@ -37,11 +37,13 @@ final class SessionsModel: ObservableObject {
 
     /// Starts a session in a new tab, or shows the tab already open for
     /// this ID. An empty password uses the one saved in Keychain.
+    /// AI agents pass `showExisting: false` so attaching to a session that is
+    /// already open never switches the tab the user is looking at.
     @discardableResult
-    func connect(partnerID: String, password: String) -> ConnectionModel? {
+    func connect(partnerID: String, password: String, showExisting: Bool = true) -> ConnectionModel? {
         formError = nil
         if let existing = activeSession(for: partnerID) {
-            select(existing)
+            if showExisting { select(existing) }
             return existing
         }
         let model = makeModel()

@@ -44,13 +44,22 @@ struct MCPRemoteShellTests {
         #expect(MCPRemoteShell.chunks("") == [""])
     }
 
-    @Test("The Run-box launcher fits and only runs its own tagged script")
-    func launcher() {
-        let id = MCPRemoteShell.newID()
-        let line = MCPRemoteShell.launcher(id: id)
-        #expect(line.count < 259)
-        #expect(line.contains("StartsWith('#MVRUN-\(id)')"))
-        #expect(MCPRemoteShell.wrapper(id: id, script: "Get-Date").hasPrefix("#MVRUN-\(id)\n"))
+    @Test("Only a plain `powershell` goes in the Run box; the window runs only its own tagged commands")
+    func supportWindow() {
+        let sid = MCPRemoteShell.newID(), id = MCPRemoteShell.newID()
+        #expect(MCPRemoteShell.consoleCommand == "powershell")
+        let boot = MCPRemoteShell.bootLine(sid: sid)
+        #expect(boot.contains("StartsWith('#MVBOOT-\(sid)')"))
+        #expect(!boot.lowercased().contains("hidden") && !boot.lowercased().contains("iex"))
+        let loop = MCPRemoteShell.consoleScript(sid: sid, admin: false)
+        #expect(loop.hasPrefix("#MVBOOT-\(sid)\n"))
+        #expect(MCPRemoteShell.isChannelText(loop))
+        let command = MCPRemoteShell.command(id: id, sid: sid, note: "Đang kiểm tra", script: "Get-Date")
+        let lines = command.split(separator: "\n").map(String.init)
+        #expect(lines.count == 3 && lines[0] == "#MVRUN-\(id)@\(sid)")
+        #expect(String(data: Data(base64Encoded: lines[1])!, encoding: .utf8) == "Đang kiểm tra")
+        #expect(String(data: Data(base64Encoded: lines[2])!, encoding: .utf8) == "Get-Date")
+        #expect(MCPRemoteShell.isChannelText(command))
     }
 
     @Test("Paths are quoted for PowerShell and named for saving")

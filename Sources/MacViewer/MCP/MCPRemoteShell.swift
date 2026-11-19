@@ -1,14 +1,15 @@
 import Foundation
 
 /// A command channel to a Windows computer built only from what an UltraViewer
-/// session already offers: the agent's keyboard (Win+R) and the shared
-/// clipboard. MacViewer puts a PowerShell script on the remote clipboard, the
-/// Run box starts PowerShell to execute it, and the script answers by copying
-/// tagged text back. Files travel the same way in deflated base64 chunks, each
-/// one acknowledged before the next is sent.
+/// session already offers: the agent's keyboard and the shared clipboard.
+/// MacViewer opens one visible PowerShell support window (Win+R → `powershell`),
+/// starts a small loop in it, then passes each script over the remote clipboard;
+/// the window shows the command to the person there and copies tagged text back.
+/// Files travel the same way in deflated base64 chunks, each one acknowledged
+/// before the next is sent.
 ///
-/// Every channel text starts with `MVR-<id>|` (or `#MVRUN-<id>` for the script
-/// itself) so the session can keep it off this Mac's clipboard.
+/// Every channel text starts with `MVR-<id>|` (or `#MVRUN-`/`#MVBOOT-` for
+/// scripts) so the session can keep it off this Mac's clipboard.
 enum MCPRemoteShell {
     /// Base64 characters per clipboard message; well under the 512K UTF-16 limit.
     static let chunkCharacters = 192_000
@@ -21,7 +22,7 @@ enum MCPRemoteShell {
     }
 
     static func isChannelText(_ text: String) -> Bool {
-        text.hasPrefix("MVR-") || text.hasPrefix("#MVRUN-")
+        text.hasPrefix("MVR-") || text.hasPrefix("#MVRUN-") || text.hasPrefix("#MVBOOT-")
     }
 
     /// A tagged reply from the remote script.
@@ -117,27 +118,115 @@ enum MCPRemoteShell {
         "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('\(Data(text.utf8).base64EncodedString())'))"
     }
 
-    /// What is typed into the Run box. It runs only a script tagged with this
-    /// id, so text the remote person copies in the meantime is never executed.
-    static func launcher(id: String) -> String {
-        "powershell -NoP -Ep Bypass -W Hidden -C \"$c=Get-Clipboard -Raw;if($c -and $c.StartsWith('#MVRUN-\(id)')){iex $c}\""
+    // MARK: Support console
+    //
+    // Commands run in ONE visible PowerShell window per remote session, opened
+    // the way a person would (Win+R → `powershell`). Earlier versions typed a
+    // hidden `powershell -W Hidden -Ep Bypass … iex (Get-Clipboard)` line into
+    // the Run box, which is exactly the "ClickFix" attack Windows Security now
+    // blocks, and the person at the computer could not see what was happening.
+    // Now the window shows every command with a note in the person's language,
+    // asks them to wait, and prints the result, so nothing is hidden.
+
+    /// Typed into the Run box. Nothing else ever goes on that command line.
+    static let consoleCommand = "powershell"
+
+    /// Default note shown to the person when the agent gives none.
+    static let defaultNote = "Đang chạy lệnh kiểm tra / Running a check"
+
+    /// Typed into the new window: starts the loop placed on the clipboard,
+    /// only if it carries this window's tag.
+    static func bootLine(sid: String) -> String {
+        "$b=Get-Clipboard -Raw; if ($b -and $b.StartsWith('#MVBOOT-\(sid)')) { & ([scriptblock]::Create($b)) }"
     }
 
-    /// Runs `script` and copies `MVR-<id>|res|EXIT=<code>\n<output>` back.
-    static func wrapper(id: String, script: String) -> String {
-        let encoded = Data(script.utf8).base64EncodedString()
-        return """
-        #MVRUN-\(id)
+    /// The loop running in the support window. It answers `MVR-<sid>|ack|-9`
+    /// when ready, then runs each `#MVRUN-<id>@<sid>` command once: it answers
+    /// `MVR-<id>|ack|-2` when it picks one up and `MVR-<id>|res|EXIT=<code>\n<output>`
+    /// when done. Only commands for its own `sid` run, so text the person
+    /// copies is never executed.
+    static func consoleScript(sid: String, admin: Bool) -> String {
+        """
+        #MVBOOT-\(sid)
         $ProgressPreference='SilentlyContinue'
-        $__c=0
-        try {
-          $__sb=[scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('\(encoded)')))
-          $__o=(& $__sb *>&1 | Out-String -Width 300)
-          if ($LASTEXITCODE) { $__c=$LASTEXITCODE }
-        } catch { $__o=($_ | Out-String); $__c=1 }
-        if (-not $__o) { $__o='' }
-        if ($__o.Length -gt \(outputLimit)) { $__o='[... first ' + ($__o.Length-\(outputLimit)) + ' characters cut ...]' + "`n" + $__o.Substring($__o.Length-\(outputLimit)) }
-        Set-Clipboard -Value ('MVR-\(id)|res|EXIT=' + $__c + "`n" + $__o)
+        $__sid='\(sid)'
+        # Windows Terminal draws Vietnamese; the classic console's fonts (Lucida
+        # Console, raster) do not, so text shown there drops the accents.
+        function __t([string]$s) {
+          if ($env:WT_SESSION) { return $s }
+          $d=$s.Normalize([Text.NormalizationForm]::FormD); $b=New-Object Text.StringBuilder
+          foreach ($ch in $d.ToCharArray()) { if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne 'NonSpacingMark') { [void]$b.Append($ch) } }
+          ($b.ToString().Normalize([Text.NormalizationForm]::FormC)) -creplace 'đ','d' -creplace 'Đ','D'
+        }
+        try { $Host.UI.RawUI.WindowTitle='\(admin ? "Hỗ trợ kỹ thuật từ xa (quản trị) - đừng đóng" : "Hỗ trợ kỹ thuật từ xa - đừng đóng")' } catch {}
+        Write-Host (__t '')
+        Write-Host (__t '  HỖ TRỢ KỸ THUẬT TỪ XA / REMOTE SUPPORT\(admin ? " (QUYỀN QUẢN TRỊ)" : "")') -ForegroundColor Cyan
+        Write-Host (__t '  Kỹ thuật viên chạy lệnh kiểm tra và sửa lỗi trong cửa sổ này. Mọi lệnh đều hiện ở đây.') -ForegroundColor Cyan
+        Write-Host (__t '  Vui lòng không gõ vào và không đóng cửa sổ này cho tới khi kỹ thuật viên báo xong.') -ForegroundColor Cyan
+        Write-Host (__t '  The technician runs checks and fixes here; every command is shown. Closing this window stops them.') -ForegroundColor DarkCyan
+        Set-Clipboard -Value "MVR-$__sid|ack|-9"
+        $__done=@{}
+        while ($true) {
+          $__c=$null
+          try { $__c=Get-Clipboard -Raw } catch {}
+          if (\(admin ? "$false" : "$true") -and $__c -and $__c.StartsWith('#MVBOOT-') -and -not $__c.StartsWith('#MVBOOT-' + $__sid)) {
+            Write-Host (__t '')
+            Write-Host (__t '  Đã mở cửa sổ hỗ trợ mới, cửa sổ này tự đóng. / A new support window replaced this one.') -ForegroundColor DarkCyan
+            Start-Sleep -Seconds 2
+            exit
+          }
+          if ($__c -and $__c.StartsWith('#MVRUN-')) {
+            $__l=$__c -split "`r?`n"
+            $__h=$__l[0].Trim().Substring(7)
+            $__at=$__h.IndexOf('@')
+            if ($__at -gt 0 -and $__l.Count -ge 3) {
+              $__id=$__h.Substring(0,$__at)
+              if ($__h.Substring($__at+1) -eq $__sid -and -not $__done.ContainsKey($__id)) {
+                $__done[$__id]=1
+                Set-Clipboard -Value "MVR-$__id|ack|-2"
+                $__note=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__l[1].Trim()))
+                $__src=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__l[2].Trim()))
+                Write-Host (__t '')
+                Write-Host (__t ('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $__note)) -ForegroundColor Yellow
+                Write-Host (__t '  Vui lòng đợi, đừng đóng cửa sổ này... / Please wait...') -ForegroundColor DarkYellow
+                $__sl=@($__src -split "`r?`n" | Where-Object { $_.Trim() })
+                $__sl | Select-Object -First 12 | ForEach-Object { Write-Host (__t ('    > ' + $_)) -ForegroundColor DarkGray }
+                if ($__sl.Count -gt 12) { Write-Host (__t ('    > ... (+' + ($__sl.Count - 12) + ')')) -ForegroundColor DarkGray }
+                $__w=[Diagnostics.Stopwatch]::StartNew()
+                $__code=0
+                $global:LASTEXITCODE=0
+                try {
+                  $__o=(& ([scriptblock]::Create($__src)) *>&1 | Out-String -Width 300)
+                  if ($global:LASTEXITCODE) { $__code=$global:LASTEXITCODE }
+                } catch { $__o=($_ | Out-String); $__code=1 }
+                if (-not $__o) { $__o='' }
+                @($__o.TrimEnd() -split "`r?`n") | Select-Object -Last 25 | ForEach-Object { Write-Host (__t ('    ' + $_)) -ForegroundColor Gray }
+                $__s=[int]$__w.Elapsed.TotalSeconds
+                if ($__code -eq 0) { Write-Host (__t ('  Xong (' + $__s + ' giây) / Done')) -ForegroundColor Green }
+                else { Write-Host (__t ('  Có lỗi (mã ' + $__code + '), kỹ thuật viên đang xem / Error, being checked')) -ForegroundColor Red }
+                if ($__o.Length -gt \(outputLimit)) { $__o='[... first ' + ($__o.Length-\(outputLimit)) + ' characters cut ...]' + "`n" + $__o.Substring($__o.Length-\(outputLimit)) }
+                Set-Clipboard -Value ('MVR-' + $__id + '|res|EXIT=' + $__code + "`n" + $__o)
+              }
+            }
+          }
+          Start-Sleep -Milliseconds 300
+        }
+        """
+    }
+
+    /// A command for the support window `sid`: tag line, note, script.
+    static func command(id: String, sid: String, note: String, script: String) -> String {
+        "#MVRUN-\(id)@\(sid)\n\(Data(note.utf8).base64EncodedString())\n\(Data(script.utf8).base64EncodedString())"
+    }
+
+    /// Run in the normal support window: saves the loop for `adminSid` as a
+    /// script file and opens it in an elevated PowerShell window (UAC prompt).
+    static func elevateScript(adminSid: String) -> String {
+        """
+        $p=Join-Path $env:TEMP 'macviewer-ho-tro-quan-tri.ps1'
+        [IO.File]::WriteAllText($p, \(literal(consoleScript(sid: adminSid, admin: true))), (New-Object Text.UTF8Encoding $true))
+        Start-Process powershell -Verb RunAs -ArgumentList @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $p + '"'))
+        'Administrator window requested.'
         """
     }
 
