@@ -106,7 +106,8 @@ enum MCPRemoteShell {
     /// The file name in a Windows (or POSIX) path.
     static func fileName(ofRemotePath path: String) -> String {
         let name = path.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last.map(String.init) ?? ""
-        let safe = name.filter { !":*?\"<>|".contains($0) }
+        // A bare drive ("C:\") has no file name.
+        let safe = name.hasSuffix(":") ? "" : name.filter { !":*?\"<>|".contains($0) }
         return safe.isEmpty ? "remote-file" : safe
     }
 
